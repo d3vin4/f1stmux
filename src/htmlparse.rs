@@ -65,7 +65,7 @@ pub fn parse(html: &str) -> Parsed {
                         scripts.push(buf);
                     }
                 }
-                if tag == "title" {
+                if tag == "title" && title.is_empty() {
                     let mut buf = String::new();
                     for c in node.children.borrow().iter() {
                         if let NodeData::Text { ref contents } = c.data {

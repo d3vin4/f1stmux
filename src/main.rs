@@ -55,6 +55,8 @@ enum Cmd {
     },
     /// DevTools trong terminal: vòng lặp lệnh trên tab hiện tại.
     Devtools { url: String },
+    /// MCP server qua stdio cho AI client (opencode, Claude Code...).
+    Mcp,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -109,6 +111,7 @@ async fn run(cfg: &Config, cmd: Cmd) -> Result<(), String> {
         }
         Cmd::Bench { urls, compare } => f1stmux::cli::bench(cfg, urls.as_deref(), compare.as_deref()).await,
         Cmd::Devtools { url } => f1stmux::cli::devtools(cfg, &url).await,
+        Cmd::Mcp => f1stmux::mcp::run(cfg.clone()).await,
     }
 }
 

@@ -138,8 +138,26 @@ pub async fn tool(srv: &Arc<crate::rpc::Server>, name: &str, p: &Value) -> Resul
 
         // ---- plugin ----
         "plugin_list" => {
-            let r = crate::plugin::Registry::new(crate::plugin::default_root());
+            let mut r = crate::plugin::Registry::new(crate::plugin::default_root());
+            r.scan();
             Ok(json!({ "plugins": r.list().iter().map(|p| p.manifest.id.clone()).collect::<Vec<_>>() }))
+        }
+        "plugin_info" => {
+            let id = s(p, "id");
+            if id.is_empty() { return Err("thiếu `id`".into()); }
+            let mut r = crate::plugin::Registry::new(crate::plugin::default_root());
+            r.scan();
+            match r.get(&id) {
+                Some(pl) => Ok(json!({
+                    "id": pl.manifest.id, "name": pl.manifest.name,
+                    "version": pl.manifest.version, "kind": pl.manifest.kind.as_str(),
+                    "entry": pl.manifest.entry, "api": pl.manifest.api,
+                    "enabled": pl.enabled(),
+                    "permissions": pl.manifest.permissions.iter().map(|x| x.as_str()).collect::<Vec<_>>(),
+                    "hooks": pl.manifest.hooks.iter().map(|x| x.as_str()).collect::<Vec<_>>(),
+                })),
+                None => Err(format!("không có plugin `{id}`")),
+            }
         }
         "plugin_install" => {
             let dir = s(p, "path");
@@ -175,6 +193,52 @@ pub fn catalog() -> Value {
         {"name":"plugin_info","desc":"Chi tiết một plugin"},
         {"name":"bench","desc":"Đo hiệu năng"}
     ])
+}
+
+fn str_prop(d: &str) -> Value { json!({"type":"string","description":d}) }
+fn bool_prop(d: &str) -> Value { json!({"type":"boolean","description":d}) }
+fn num_prop(d: &str) -> Value { json!({"type":"number","description":d}) }
+
+/// Tool theo định dạng MCP `tools/list`, kèm inputSchema để AI client validate.
+pub fn mcp_tools() -> Value {
+    let opt_session = ("session", str_prop("ID session, bỏ trống để tạo mới"));
+    let defs: Vec<(&str, &str, Vec<(&str, Value)>, Vec<&str>)> = vec![
+        ("navigate", "Mở URL, trả về text/console/network/captcha", vec![
+            ("url", str_prop("URL cần mở")), ("session", str_prop("ID session")),
+            ("js", bool_prop("Chạy JS của trang (mặc định true)")),
+            ("quiet_ms", num_prop("Ngưỡng network-idle")), ("budget_ms", num_prop("Ngân sách ms")),
+        ], vec!["url"]),
+        ("extract_text", "Trích text từ trang đang nạp", vec![opt_session.clone()], vec![]),
+        ("snapshot_dom", "innerHTML của trang đang nạp", vec![opt_session.clone()], vec![]),
+        ("query", "querySelector trên DOM (tag, #id, .class, [attr])", vec![
+            ("selector", str_prop("CSS selector đơn giản")), ("session", str_prop("ID session")), ("all", bool_prop("Trả về tất cả, mặc định node đầu")),
+        ], vec!["selector"]),
+        ("eval_js", "Chạy JS expression trong realm của trang, trả về JSON", vec![
+            ("script", str_prop("JS expression")), ("session", str_prop("ID session")),
+        ], vec!["script"]),
+        ("network_log", "Danh sách request đã đi qua session", vec![opt_session.clone()], vec![]),
+        ("har_export", "Xuất HAR 1.2 của mọi session", vec![], vec![]),
+        ("blocklist_test", "Xem URL có bị chặn không (mặc định kiểm như XHR)", vec![
+            ("url", str_prop("URL cần kiểm")), ("kind", str_prop("document|script|xhr|image")),
+        ], vec!["url"]),
+        ("stealth_profile", "Xem profile giả danh tính đang dùng", vec![("name", str_prop("Để trống để xem"))], vec![]),
+        ("session_new", "Tạo session mới (RAM-only)", vec![], vec![]),
+        ("session_info", "Thông tin session", vec![opt_session.clone()], vec![]),
+        ("session_close", "Xoá session và mọi dấu vết trong RAM", vec![opt_session.clone()], vec![]),
+        ("kill_switch", "Tắt mọi hook plugin ngay lập tức", vec![("on", bool_prop("true=tắt hook"))], vec![]),
+        ("plugin_list", "Liệt kê plugin đã cài", vec![], vec![]),
+        ("plugin_install", "Cài plugin từ thư mục", vec![("path", str_prop("Đường dẫn thư mục plugin"))], vec!["path"]),
+        ("plugin_info", "Chi tiết một plugin", vec![("id", str_prop("ID plugin"))], vec!["id"]),
+        ("bench", "Ghi chú: dùng CLI `f1stmux bench`", vec![], vec![]),
+    ];
+    let tools: Vec<Value> = defs.into_iter().map(|(name, desc, props, req)| {
+        let mut map = serde_json::Map::new();
+        for (k, v) in props { map.insert(k.into(), v); }
+        json!({"name": name, "description": desc,
+               "inputSchema": {"type": "object", "properties": Value::Object(map),
+                               "required": req, "additionalProperties": true}})
+    }).collect();
+    Value::Array(tools)
 }
 
 pub fn cfg_of(srv: &Arc<crate::rpc::Server>) -> &Config { &srv.cfg }

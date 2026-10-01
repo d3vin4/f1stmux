@@ -13,6 +13,7 @@ pub mod fetch;
 pub mod htmlparse;
 pub mod inspector;
 pub mod jsenv;
+pub mod mcp;
 pub mod net;
 pub mod plugin;
 pub mod rpc;

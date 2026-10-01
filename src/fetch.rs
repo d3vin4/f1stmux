@@ -147,8 +147,8 @@ async fn run(
                 url: url.to_string(),
                 final_url: cur.to_string(),
                 status,
-                headers,
-                body: decode_text(&bytes),
+                headers: headers.clone(),
+                body: decode_text(&bytes, &headers),
                 elapsed_ms: start.elapsed().as_millis(),
                 redirects,
                 from_cache: false,
@@ -190,15 +190,50 @@ fn check_url(url: &str) -> Result<reqwest::Url, String> {
     Ok(u)
 }
 
-/// Không có `encoding_rs` nên không dịch được charset: UTF-8 thì giữ nguyên byte,
-/// còn lại thay bằng U+FFFD. Đủ dùng cho HTML tiếng Anh/Việt, và thà không
-/// đoán bừa còn hơn giải mã sai.
-fn decode_text(b: &[u8]) -> String {
+/// Giải mã body theo charset thật: header Content-Type trước, rồi <meta charset>
+/// trong 2 KB đầu. Không tìm thấy thì UTF-8 lossy. Không có crate này thì cả
+/// web windows-1251/shift_jis/gbk đều thành mojibake — rutracker đã chứng minh.
+fn decode_text(b: &[u8], headers: &[(String, String)]) -> String {
     let b = b.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(b);
+    if let Some(cs) = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        .and_then(|(_, v)| v.split(';').find_map(|p| {
+            let p = p.trim();
+            p.strip_prefix("charset=")
+                .or_else(|| p.strip_prefix("charset ="))
+                .map(|s| s.trim_matches(['"', '\'']).trim().to_string())
+        }))
+        .or_else(|| meta_charset(b))
+        && !cs.eq_ignore_ascii_case("utf-8")
+        && !cs.eq_ignore_ascii_case("utf8")
+    {
+        if let Some(enc) = encoding_rs::Encoding::for_label(cs.as_bytes()) {
+            return enc.decode(b).0.into_owned();
+        }
+    }
     match std::str::from_utf8(b) {
         Ok(s) => s.to_string(),
         Err(_) => String::from_utf8_lossy(b).into_owned(),
     }
+}
+
+/// Quét <meta charset="..."> hoặc <meta ... content="...charset=..."> trong 2 KB đầu.
+/// Chỉ ASCII nên so trực tiếp trên byte, không cần decode trước.
+fn meta_charset(b: &[u8]) -> Option<String> {
+    let head = &b[..b.len().min(2048)];
+    let lower: Vec<u8> = head.iter().map(|c| c.to_ascii_lowercase()).collect();
+    let s = std::str::from_utf8(&lower).ok()?;
+    let i = s.find("<meta")?;
+    let tag = &s[i..s[i..].find('>')? + i];
+    if let Some(j) = tag.find("charset=") {
+        let v = tag[j + 8..].trim_start_matches([' ', '"', '\'']);
+        let end = v.find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == ':')).unwrap_or(v.len());
+        if !v[..end].is_empty() {
+            return Some(v[..end].to_string());
+        }
+    }
+    None
 }
 
 // ───────────────────────── cookie jar ─────────────────────────

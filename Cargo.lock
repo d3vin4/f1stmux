@@ -380,6 +380,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "clap",
+ "encoding_rs",
  "html5ever",
  "markup5ever_rcdom",
  "rand",

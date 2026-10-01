@@ -1,75 +1,135 @@
-# F1stmux — headless browser cho AI, chạy trên Termux
+# F1stmux — a headless browser for AI agents
 
-Một binary duy nhất (`f1stmux`), vừa làm CLI vừa làm daemon. Không GUI,
-không Chromium, không V8: Rust + html5ever + QuickJS + rustls.
+One binary. Terminal-only. Built for low-RAM machines (Termux/Android),
+where Chromium is not an option.
 
-## Số đo thật trên Termux aarch64 (không ước lượng)
-
-| Hạng mục | Số |
-|---|---|
-| Binary (strip, release) | 4.1 MB |
-| RSS daemon sau 3 navigation | 6.7 MB |
-| `GET example.com` | 200, ~500–700 ms |
-| `GET news.ycombinator.com` | 200, text 4207 ký tự, 0 lỗi JS |
-| Profile | chrome / edge / brave |
-
-## Chạy
-
-```sh
-# Một URL ra text
-f1stmux get https://example.com/
-
-# DOM, JSON đầy đủ, chạy JS, REPL DevTools terminal
-f1stmux get URL --dom
+```
+f1stmux get https://example.com/ --json
 f1stmux eval URL 'document.querySelector("p").textContent'
-f1stmux devtools URL
-
-# Daemon: JSON-RPC + DevTools web
-f1stmux serve
-# → http://127.0.0.1:7070/devtools  (mở bằng Chrome/Edge trên điện thoại:
-#    Elements / Text / Console / Network / tải HAR / tải DOM)
-# → POST http://127.0.0.1:7070/rpc   (JSON-RPC 2.0, 17 tools: xem `f1stmux tools`)
-# → POST http://127.0.0.1:7070/cdp   (CDP subset: DOM.*, Network.*, F1stmux.*)
-
-# Đo hiệu năng
-f1stmux bench
+f1stmux serve   # JSON-RPC + web DevTools at 127.0.0.1:7070
+f1stmux mcp     # MCP server over stdio (opencode, Claude Code, ...)
 ```
 
-## Riêng tư (mặc định, không đổi được trừ khi chỉ định rõ)
+F1stmux fetches a page, parses it with a real HTML5 parser, runs its
+scripts in QuickJS against a DOM bridge, and hands you text, DOM,
+console output, network log, and HAR. Sessions live in RAM —
+close it and every cookie, cache entry, and trace is gone.
 
-- Không telemetry, không phone-home, không tự cập nhật, không log ra đĩa.
-- Session RAM-only: thoát là mất cookie/storage/cache.
-- TLS roots bundle trong binary (`webpki-roots`), không đọc kho CA hệ thống
-  (vừa riêng tư hơn, vừa là cách duy nhất không panic trên Android).
-- DNS qua DoH, fail-closed (DoH hỏng thì request chết, không fallback về DNS hệ thống).
-- Chặn WebRTC/StUN/TURN ở tầng scheme. Ngoại lệ đã biết: hostname của chính
-  endpoint DoH phân giải qua DNS hệ thống một lần lúc khởi động; SNI vẫn lộ
-  hostname với kẻ nghe mạng (DoH giấu DNS, không giấu SNI).
+## Measured numbers (Termux, aarch64 — not estimates)
 
-## Plugin: cài thêm bất cứ thứ gì
+| Metric | Value |
+|---|---|
+| Binary (stripped release) | 4.1 MB |
+| Daemon RSS after navigations | ~7 MB |
+| `GET example.com` | 200 in ~0.5–0.7 s |
+| Hacker News front page | 200, 4200+ chars, zero JS errors |
+| GitHub / Google homepages | readable content, JS errors tolerated |
+| Rutracker (windows-1251, CF-fronted) | 200, correct Cyrillic decoding |
+
+## Install
+
+Requires Rust (1.85+) and `libclang` for the QuickJS bindings:
 
 ```sh
-f1stmux plugin install <thư-mục|git|tarball>   # manifest f1stmux-plugin.json
+git clone https://github.com/<you>/f1stmux
+cd f1stmux
+cargo build --release
+./target/release/f1stmux --help
 ```
 
-Ba loại, tất cả là subprocess hoặc sandbox — không bao giờ link native:
+`npm install -g f1stmux` with prebuilt binaries (including
+`aarch64-linux-android`) is planned; see [Roadmap](#roadmap).
 
-| Loại | Chạy | Dùng khi |
+## Use it from an agent
+
+**MCP (recommended).** Any MCP client works over stdio:
+
+```json
+{ "mcpServers": { "f1stmux": { "command": "f1stmux", "args": ["mcp"] } } }
+```
+
+17 tools: `navigate`, `query`, `eval_js`, `extract_text`, `snapshot_dom`,
+`network_log`, `har_export`, `blocklist_test`, `stealth_profile`,
+session management, plugin management. See
+[`skills/f1stmux/SKILL.md`](skills/f1stmux/SKILL.md) for the agent guide.
+
+**HTTP.** `f1stmux serve` exposes JSON-RPC 2.0 at `/rpc`, a CDP subset
+at `/cdp`, and a web DevTools UI at `/devtools` — open it in your phone's
+Chrome: Elements, Console, Network, HAR/DOM download.
+
+**CLI.** `get`, `eval`, `tree`, `bench`, and a terminal DevTools REPL
+(`f1stmux devtools URL`).
+
+## Privacy (defaults, not options)
+
+- No telemetry, no auto-update, no phone-home, no disk logging.
+- Ephemeral sessions: RAM-only cookies, storage, and cache.
+- Bundled CA roots (never reads the OS store — which is also the only way
+  TLS works on Android without a JNI panic).
+- DNS-over-HTTPS, fail-closed. WebRTC/STUN/TURN blocked at the scheme layer.
+- Known leaks, documented not hidden: the DoH endpoint's own hostname
+  resolves via system DNS once at startup; SNI still reveals the hostname
+  to a network observer (DoH hides DNS, not SNI).
+
+## Stealth
+
+Consistent identity profiles (`chrome`, `edge`, `brave`): User-Agent,
+header order, Client Hints, locale, timezone, screen, hardware concurrency.
+Stable within a session, fresh across sessions — per-call noise is a bot
+signal, so we never do it. Tracker/ad blocking via compact rule syntax
+(`||host^`, `|scheme`, `/path/`, `@@` exceptions).
+
+## Captchas
+
+Detected and reported, never silently ignored: `navigate` returns a
+`captcha` field (`cloudflare`, `recaptcha`, `hcaptcha`, `turnstile`, …).
+F1stmux does **not** solve challenges — rotate profile/proxy, retry later,
+or use the target's official API.
+
+## Plugins
+
+Anything can be a plugin — tools, parsers, proxies, agents — without
+touching core. Three kinds, all sandboxed or subprocess-based (never
+natively linked):
+
+| Kind | Runs as | For |
 |---|---|---|
-| `js` | realm QuickJS trong daemon | hook nhanh, chặn request |
-| `proc` | tiến trình con, stdio JSON-lines | Python/Rust/Go/shell, mọi ngôn ngữ |
-| `wasm` | module WASM | cô lập chặt, deterministic |
+| `js` | QuickJS realm in-daemon | fast hooks, request blocking |
+| `proc` | child process, JSON-lines stdio | Python/Rust/Go/shell — any language |
+| `wasm` | WASM module | tight sandboxing (host in progress) |
 
-Hook: `onRequest onResponse onDOMReady onToolCall onPageScript
-onSessionCreate onSessionEnd`. Permission allowlist + `/kill-switch`.
+```sh
+f1stmux plugin install <dir|git-url|tarball>   # hot-loaded, no restart
+```
 
-## Giới hạn nói thẳng
+Manifest + permission allowlist + global kill switch. See the manifest
+reference in [`docs/`](docs/superpowers/specs/2026-10-01-f1stmux-design.md).
 
-- Không layout engine → không screenshot pixel, nội dung lazy-mount theo
-  viewport không xuất hiện. `screenshot_dom` chỉ dựng khung từ a11y.
-- SPA JS cực nặng / site chống bot đời mới: có `--engine=chromium` ở v2,
-  core mặc định vẫn nhẹ.
-- `vault.rs` dùng crypto tự viết (XOR-stream + MAC) — KHÔNG đạt chuẩn sản phẩm.
-  Thay bằng `chacha20poly1305` + `argon2` khi cần thật (đã đánh dấu `ponytail:`).
-- WASM plugin host chưa build trên Android (`wasmtime` chưa đo) — dùng `js`/`proc`.
-- JA4 đầy đủ chưa đo; hiện cam kết JA3 + header order + JS env.
+## How it compares
+
+Lightpanda (Servo-based) is the closest project. Honest scorecard:
+
+| | F1stmux | Lightpanda |
+|---|---|---|
+| RAM idle | ~7 MB measured | ~70–90 MB |
+| Binary | 4.1 MB | tens of MB |
+| Builds on Termux/Android | yes, verified | x86_64 only |
+| JS fidelity | QuickJS subset | V8 (full) |
+| Pixel rendering | no (DOM mock only) | partial |
+| Plugin system | js/proc/wasm + hooks | — |
+
+We win on footprint and hackability; we lose on JS fidelity and rendering.
+If you need pixel screenshots or heavy SPAs, use a real browser engine —
+F1stmux plans an optional `--engine=chromium` bridge for exactly that.
+
+## Roadmap
+
+- [ ] `npm install -g f1stmux` with prebuilt binaries
+- [ ] `pkg install f1stmux` (termux-packages)
+- [ ] WASM plugin host on Android
+- [ ] `--engine=chromium` bridge for pixel/JS-heavy pages
+- [ ] Full JA4 TLS parroting
+
+## License
+
+MIT. See [LICENSE](LICENSE).

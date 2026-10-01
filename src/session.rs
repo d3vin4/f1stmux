@@ -50,6 +50,10 @@ pub struct NavResult {
     pub content_from_js: bool,
     pub timed_out: bool,
     pub truncated: bool,
+    /// Loại captcha/challenge phát hiện được (None = không thấy).
+    /// F1stmux KHÔNG giải captcha — field này để AI biết mà đổi chiến thuật
+    /// (đổi profile/proxy, thử lại sau, hoặc báo người dùng).
+    pub captcha: Option<String>,
 }
 
 #[derive(Default)]
@@ -89,11 +93,40 @@ impl Session {
     }
 }
 
-/// Điều phối một lần navigate hoàn chỉnh.
+/// Phát hiện trang captcha/challenge bằng dấu hiệu tĩnh (URL, title, marker
+/// trong HTML). Nhanh, không JS. Không giải — chỉ gắn nhãn để AI đổi chiến thuật.
+pub fn detect_captcha(final_url: &str, title: &str, body: &str) -> Option<String> {
+    let u = final_url.to_lowercase();
+    for m in ["__cf_chl", "/sorry", "captcha", "validate", "are-you-human", "security-check", "challenge-platform"] {
+        if u.contains(m) {
+            return Some("challenge-url".into());
+        }
+    }
+    let t = title.to_lowercase();
+    for m in ["just a moment", "attention required", "verify you are human", "checking your browser", "please verify", "access denied", "datadome", "perimeterx"] {
+        if t.contains(m) {
+            return Some("challenge-title".into());
+        }
+    }
+    let b = body.to_lowercase();
+    // Thứ tự: loại cụ thể trước, generic sau.
+    for (m, k) in [
+        ("cf-turnstile", "turnstile"), ("cf-challenge", "cloudflare"),
+        ("g-recaptcha", "recaptcha"), ("h-captcha", "hcaptcha"),
+        ("data-sitekey", "captcha-form"), ("arkose", "arkose"),
+        ("funcaptcha", "arkose"), ("geetest", "geetest"),
+    ] {
+        if b.contains(m) {
+            return Some(k.into());
+        }
+    }
+    None
+}
 ///
 /// Đây là chỗ tích hợp chặt nhất của dự án, nên nó là hàm tự do, không phải
 /// trait: không có lý do để trừu tượng hoá một pipeline duy nhất.
 #[allow(clippy::too_many_arguments)]
+/// Điều phối một lần navigate hoàn chỉnh.
 pub async fn navigate(
     url: &str,
     cfg: &Config,
@@ -183,6 +216,7 @@ pub async fn navigate(
     sess.persist_dom();
 
     let html = dom.borrow().inner_html(0);
+    let captcha = detect_captcha(&f.final_url, &title0, &f.body);
     let res = NavResult {
         tab: sess.id.clone(),
         url: f.url.clone(),
@@ -199,6 +233,7 @@ pub async fn navigate(
         content_from_js,
         timed_out,
         truncated: false,
+        captcha,
     };
 
     sess.dom = Some(dom.clone());
