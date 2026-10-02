@@ -1,9 +1,9 @@
-//! Hồ sơ danh tính trình duyệt.
+//! Browser identity profiles.
 //!
-//! Nguyên tắc: hồ sơ phải *nhất quán nội bộ*. Tín hiệu tệ nhất không phải là
-//! "giả sai", mà là "giả nửa vời" — UA Edge nhưng header Chrome, timezone Tokyo
-//! nhưng locale Mỹ. Mỗi profile gom UA + header order + client hints + màn hình
-//! + timezone + locale + concurrency vào một chỗ để chúng không thể lệch nhau.
+//! Principle: a profile must be *internally consistent*. The worst signal is not
+//! "faked wrong", it is "faked halfway" — Edge UA but Chrome headers, Tokyo
+//! timezone but a US locale. Each profile bundles UA + header order + client
+//! hints + screen + timezone + locale + concurrency in one place so they cannot drift apart.
 
 use serde::Serialize;
 
@@ -11,7 +11,7 @@ use serde::Serialize;
 pub struct Profile {
     pub name: &'static str,
     pub ua: &'static str,
-    /// Thứ tự header. Browser thật gửi theo thứ tự cố định; sai thứ tự là dấu hiệu.
+    /// Header order. A real browser sends a fixed order; the wrong order is a tell.
     pub header_order: &'static [&'static str],
     pub sec_ch_ua: &'static str,
     pub platform: &'static str,
@@ -81,7 +81,7 @@ pub fn names() -> Vec<&'static str> {
     PROFILES.iter().map(|p| p.name).collect()
 }
 
-/// Header theo đúng thứ tự profile. Bảo mật: đây là dấu vết dễ bị phát hiện nhất.
+/// Headers in the exact profile order. Security: this is the easiest fingerprint to spot.
 pub fn headers(p: &Profile, referer: Option<&str>) -> Vec<(&'static str, String)> {
     let mut h: Vec<(&'static str, String)> = vec![
         ("sec-ch-ua", p.sec_ch_ua.into()),

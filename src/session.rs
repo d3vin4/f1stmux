@@ -1,7 +1,7 @@
-//! Session và tab: điều phối một lần navigate và giữ trạng thái theo phiên.
+//! Sessions and tabs: orchestrate one navigation and keep per-session state.
 //!
-//! Mặc định session **RAM-only**: cookie, storage, cache sống trong RAM và biến
-//! mất khi process chết. Ghi xuống đĩa là tuỳ chọn tường minh.
+//! Sessions are **RAM-only** by default: cookies, storage, and cache live in RAM
+//! and vanish when the process dies. Writing to disk is an explicit option.
 
 use crate::config::Config;
 use crate::inspector::NetEntry;
@@ -17,12 +17,12 @@ fn new_id(p: &str) -> String {
     format!("{p}-{}", NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
-/// Điều kiện hoàn tất navigation. Không có layout engine nên phải suy từ tín hiệu.
+/// Navigation completion condition. There is no layout engine, so it must be inferred from signals.
 #[derive(Debug, Clone, Serialize)]
 pub struct WaitFor {
-    /// Không còn request mới trong khoảng này.
+    /// No new requests within this window.
     pub quiet_ms: u64,
-    /// Tổng ngân sách thời gian.
+    /// Total time budget.
     pub budget_ms: u64,
 }
 
@@ -46,17 +46,17 @@ pub struct NavResult {
     pub console: Vec<(String, String)>,
     pub errors: Vec<String>,
     pub scripts_run: usize,
-    /// Có phải nội dung đến từ JS hay từ HTML gốc. Nói rõ để AI không bị đoán mò.
+    /// Whether the content came from JS or from the original HTML. Stated explicitly so the AI doesn't have to guess.
     pub content_from_js: bool,
     pub timed_out: bool,
     pub truncated: bool,
-    /// Loại captcha/challenge phát hiện được (None = không thấy).
-    /// F1stmux KHÔNG giải captcha — field này để AI biết mà đổi chiến thuật
-    /// (đổi profile/proxy, thử lại sau, hoặc báo người dùng).
+    /// Detected captcha/challenge kind (None = none found).
+    /// F1stmux does NOT solve captchas — this field lets the AI know and change tactics
+    /// (change profile/proxy, retry later, or tell the user).
     pub captcha: Option<String>,
-    /// Chuỗi redirect đã đi qua (mỗi hop một URL). Debug shortener/shortlink chain.
+    /// The redirect chain that was walked (one URL per hop). Debug shortener/shortlink chains.
     pub redirects: Vec<String>,
-    /// Ticket human-solve khi navigate với on_challenge=portal và gặp challenge.
+    /// Human-solve ticket when navigating with on_challenge=portal and hitting a challenge.
     pub challenge: Option<crate::challenge::ChallengeRef>,
 }
 
@@ -70,7 +70,7 @@ pub struct Session {
     pub realm: Option<Box<Realm>>,
     pub last: Option<NavResult>,
     pub kill_switch: bool,
-    /// Storage JS của riêng session này — Realm nào của session cũng dùng chung map.
+    /// This session's own JS storage — every Realm in the session shares this map.
     pub js_store: crate::jsenv::SessionStore,
 }
 
@@ -94,8 +94,8 @@ impl Session {
     }
 }
 
-/// Phát hiện trang captcha/challenge bằng dấu hiệu tĩnh (URL, title, marker
-/// trong HTML). Nhanh, không JS. Không giải — chỉ gắn nhãn để AI đổi chiến thuật.
+/// Detect a captcha/challenge page via static markers (URL, title, marker
+/// in the HTML). Fast, no JS. It does not solve — it only labels so the AI can change tactics.
 pub fn detect_captcha(final_url: &str, title: &str, body: &str) -> Option<String> {
     let u = final_url.to_lowercase();
     for m in ["__cf_chl", "/sorry", "captcha", "validate", "are-you-human", "security-check", "challenge-platform"] {
@@ -110,7 +110,7 @@ pub fn detect_captcha(final_url: &str, title: &str, body: &str) -> Option<String
         }
     }
     let b = body.to_lowercase();
-    // Thứ tự: loại cụ thể trước, generic sau.
+    // Order: specific kinds first, generic ones last.
     for (m, k) in [
         ("cf-turnstile", "turnstile"), ("cf-challenge", "cloudflare"),
         ("g-recaptcha", "recaptcha"), ("h-captcha", "hcaptcha"),
@@ -124,10 +124,10 @@ pub fn detect_captcha(final_url: &str, title: &str, body: &str) -> Option<String
     None
 }
 ///
-/// Đây là chỗ tích hợp chặt nhất của dự án, nên nó là hàm tự do, không phải
-/// trait: không có lý do để trừu tượng hoá một pipeline duy nhất.
+/// This is the tightest integration point in the project, so it is a plain function, not a
+/// trait: there is no reason to abstract a single pipeline.
 #[allow(clippy::too_many_arguments)]
-/// Điều phối một lần navigate hoàn chỉnh.
+/// Orchestrate one complete navigation.
 pub async fn navigate(
     url: &str,
     cfg: &Config,
@@ -136,20 +136,20 @@ pub async fn navigate(
     run_js: bool,
 ) -> Result<NavResult, String> {
     let prof = stealth::profile(&cfg.profile).ok_or_else(|| {
-        format!("không có profile `{}` (có: {})", cfg.profile, stealth::names().join(", "))
+        format!("no profile `{}` (available: {})", cfg.profile, stealth::names().join(", "))
     })?;
 
     let t0 = std::time::Instant::now();
-    // Blocklist là policy thật, không phải nút test: document bị chặn thì dừng ngay,
-    // script con bị chặn thì bỏ qua + ghi chú (trang chính vẫn đọc được).
+    // The blocklist is real policy, not a test button: if the document is blocked, stop immediately;
+    // if a subresource is blocked, skip it + note it (the main page stays readable).
     let bl = crate::blocklist::Blocklist::new();
     if let crate::blocklist::Decision::Block { rule } = bl.decide(url, crate::blocklist::ResourceKind::Document) {
-        return Err(format!("bị blocklist chặn ({rule}): {url}"));
+        return Err(format!("blocked by blocklist ({rule}): {url}"));
     }
     let cookie = sess.cookies.header_for(url);
     let f = crate::fetch::get(url, cfg, prof, &cookie).await?;
 
-    // Nạp Set-Cookie vào jar của session.
+    // Load Set-Cookie into the session's jar.
     sess.cookies.set_from_headers(&f.final_url, &f.headers);
 
     let parsed = htmlparse::parse(&f.body);
@@ -172,8 +172,8 @@ pub async fn navigate(
     };
 
     let mut realm = Realm::new(dom.clone(), &env, sess.js_store.clone()).map_err(|e| format!("QuickJS: {e}"))?;
-    // Nối ngân sách client vào thay vì deadline cứng — quiet_ms không áp dụng được
-    // vì JS trong realm chạy đồng bộ, không có network nền để "idle".
+    // Hook the client budget in instead of a hard deadline — quiet_ms does not apply
+    // because JS in the realm runs synchronously, with no background network to be "idle".
     realm.set_deadline_ms(wait.budget_ms);
     realm.run(crate::jsenv::DOM_JS, "dom.js");
 
@@ -193,19 +193,19 @@ pub async fn navigate(
                     realm.run(code, &format!("page:inline#{i}"));
                 }
                 htmlparse::PageScript::External(src) => {
-                    // Tải script ngoài rồi chạy theo đúng thứ tự. Lỗi tải được ghi
-                    // như lỗi page (có URL) thay vì làm hỏng cả navigation.
+                    // Fetch the external script then run it in order. A fetch failure is recorded
+                    // as a page error (with the URL) instead of breaking the whole navigation.
                     let full = reqwest::Url::options()
                         .base_url(reqwest::Url::parse(&f.final_url).ok().as_ref())
                         .parse(src)
                         .map(|u| u.to_string())
                         .unwrap_or_default();
                     if full.is_empty() || !(full.starts_with("http://") || full.starts_with("https://")) {
-                        errors.push(format!("page:{src}: URL script không hợp lệ"));
+                        errors.push(format!("page:{src}: invalid script URL"));
                     } else if let crate::blocklist::Decision::Block { rule } =
                         bl.decide(&full, crate::blocklist::ResourceKind::Script)
                     {
-                        errors.push(format!("page:{full}: bỏ qua script bị blocklist chặn ({rule})"));
+                        errors.push(format!("page:{full}: skipped script blocked by blocklist ({rule})"));
                     } else {
                         let ck = sess.cookies.header_for(&full);
                         match crate::fetch::get(&full, cfg, prof, &ck).await {
@@ -239,8 +239,8 @@ pub async fn navigate(
     errors.extend(js.errors);
     timed_out |= js.timed_out;
 
-    // Nội dung sau JS. Nếu rỗng mà HTML gốc có nội dung, dùng HTML gốc —
-    // nhưng báo rõ điều đó, không giả vờ lấy được nội dung động.
+    // Content after JS. If it is empty while the original HTML has content, use the
+    // original HTML — but say so clearly, never pretend the dynamic content was fetched.
     let text = dom.borrow().text_content(0);
     let is_empty = text.trim().is_empty();
     let has_fallback = !text0.trim().is_empty();
@@ -266,7 +266,7 @@ pub async fn navigate(
     sess.net.push(net);
 
     let html = dom.borrow().inner_html(0);
-    // Title cuối từ DOM sau JS — script đổi <title> thì báo đúng, không dùng title parse cũ.
+    // Final title from the DOM after JS — if a script changed <title>, report it accurately instead of the stale parsed title.
     let title_final = dom.borrow().query("title", 0).ok()
         .and_then(|ids| ids.into_iter().next())
         .map(|id| dom.borrow().text_content(id))
@@ -300,8 +300,8 @@ pub async fn navigate(
     Ok(res)
 }
 
-/// Chạy JS trên tab đã có, trả về JSON.
+/// Run JS on an already-loaded tab, return JSON.
 pub fn eval(sess: &Session, src: &str) -> Result<serde_json::Value, String> {
-    let r = sess.realm.as_ref().ok_or("chưa có tab nào được nạp")?;
+    let r = sess.realm.as_ref().ok_or("no tab has been loaded yet")?;
     r.eval_json(src)
 }

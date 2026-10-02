@@ -1,11 +1,11 @@
-//! MCP adapter: JSON-RPC qua stdio cho AI client (opencode, Claude Code...).
+//! MCP adapter: JSON-RPC over stdio for AI clients (opencode, Claude Code...).
 //!
-//! Thin layer duy nhất: đọc từng dòng JSON từ stdin, dispatch sang
-//! [`crate::tools::tool`] trên Server in-process, ghi response ra stdout.
-//! Không HTTP, không daemon riêng — `f1stmux mcp` là một MCP server đầy đủ.
+//! The only thin layer: read each line of JSON from stdin, dispatch to
+//! [`crate::tools::tool`] on the in-process Server, write the response to stdout.
+//! No HTTP, no separate daemon — `f1stmux mcp` is a complete MCP server.
 //!
-//! Hỗ trợ: initialize, notifications/*, tools/list, tools/call. Không hỗ trợ
-//! batch (MCP không dùng).
+//! Supported: initialize, notifications/*, tools/list, tools/call. Batch is not
+//! supported (MCP does not use it).
 
 use crate::config::Config;
 use crate::rpc::Server;
@@ -29,9 +29,9 @@ pub async fn run(cfg: Config) -> Result<(), String> {
         }
         let v: Value = match serde_json::from_str(&line) {
             Ok(v) => v,
-            Err(_) => continue, // dòng rác: bỏ qua, không chết cả server
+            Err(_) => continue, // garbage line: skip it, do not kill the whole server
         };
-        // Notification (không id): không trả lời.
+        // Notification (no id): do not reply.
         if v.get("id").is_none() || v.get("id") == Some(&Value::Null) {
             continue;
         }
@@ -39,7 +39,7 @@ pub async fn run(cfg: Config) -> Result<(), String> {
         let mut s = resp.to_string();
         s.push('\n');
         if out.write_all(s.as_bytes()).await.is_err() {
-            break; // stdout đóng = client đi rồi, thoát sạch
+            break; // stdout closed = the client left, exit cleanly
         }
         let _ = out.flush().await;
     }
@@ -63,16 +63,16 @@ async fn dispatch(srv: &Arc<Server>, v: &Value) -> Value {
         "tools/call" => {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             if name.is_empty() {
-                return err(-32602, "thiếu `name`".into());
+                return err(-32602, "missing `name`".into());
             }
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
             match crate::tools::tool(srv, name, &args).await {
-                // Chuỗi JSON đi thẳng ra text, không stringify thêm lần nữa.
+                // A JSON string goes straight out as text, no second stringify.
                 Ok(Value::String(s)) => ok(json!({"content": [{"type": "text", "text": s}]})),
                 Ok(r) => ok(json!({"content": [{"type": "text", "text": r.to_string()}]})),
                 Err(e) => ok(json!({"content": [{"type": "text", "text": e}], "isError": true})),
             }
         }
-        _ => err(-32601, format!("method chưa hỗ trợ: {method}")),
+        _ => err(-32601, format!("unsupported method: {method}")),
     }
 }

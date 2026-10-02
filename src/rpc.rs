@@ -1,10 +1,11 @@
-//! Server HTTP: JSON-RPC 2.0 + endpoint DevTools.
+//! HTTP server: JSON-RPC 2.0 + DevTools endpoints.
 //!
-//! Cố tình **không** dùng WebSocket cho CDP, dù DevTools frontend thật thường cần
-//! nó. Lý do: handshake WebSocket đòi hỏi SHA-1 + framing nhị phân — code đó
-//! phải viết tay vì ta không thêm dependency. Đổi lại, CDP qua HTTP POST hoàn
-//! toàn đủ cho thao tác kiểm tra, và ta tránh được một điểm hỏng. Nếu sau này
-//! cần stream thời gian thực thì thêm lúc đó, có số liệu chứng minh.
+//! Deliberately **not** using WebSocket for CDP, even though a real DevTools
+//! frontend usually wants one. Reason: the WebSocket handshake requires SHA-1 +
+//! binary framing — code we would have to write by hand since we add no
+//! dependency. In return, CDP over HTTP POST is entirely sufficient for
+//! inspection work, and we avoid a whole failure point. If real-time streaming is
+//! ever needed, add it then, backed by numbers.
 
 use crate::config::Config;
 use crate::session::Session;
@@ -14,11 +15,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 pub struct Server {
-    /// Config khóa được để tool stealth_profile đổi thật lúc runtime.
-    /// Mọi nơi đọc xong là clone + thả lock ngay, không giữ lock qua await.
+    /// Config behind a lock so the stealth_profile tool can really switch it at runtime.
+    /// Every reader clones and drops the lock immediately; never held across await.
     pub cfg: Mutex<Config>,
     pub sessions: Arc<Mutex<HashMap<String, Session>>>,
-    /// Ticket human-solve challenge (RAM, hết hạn 10 phút).
+    /// Human-solve challenge tickets (RAM, 10-minute expiry).
     pub challenges: crate::challenge::TicketStore,
 }
 
@@ -33,13 +34,13 @@ impl Server {
 }
 
 pub async fn serve(cfg: Config) -> Result<(), String> {
-    // Daemon không auth: bind remote mà không tường minh là tự mở control plane
-    // (navigate/plugin/install) cho cả mạng. Fail-closed trừ khi --allow-remote.
+    // The daemon has no auth: binding a remote address without saying so opens the
+    // control plane (navigate/plugin/install) to the whole network. Fail-closed unless --allow-remote.
     if cfg.is_remote_bind() && !cfg.allow_remote {
         return Err(format!(
-            "từ chối bind {0}: không phải loopback mà thiếu allow_remote. \
-             Daemon không có auth — chỉ mở remote khi bạn hiểu rõ rủi ro \
-             (--allow-remote hoặc \"allow_remote\": true trong config)",
+            "refusing to bind {0}: not loopback but allow_remote is missing. \
+             The daemon has no auth — only go remote when you understand the risk \
+             (--allow-remote or \"allow_remote\": true in the config)",
             cfg.listen
         ));
     }
@@ -47,11 +48,11 @@ pub async fn serve(cfg: Config) -> Result<(), String> {
     let addr = srv.config().listen;
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
-        .map_err(|e| format!("không bind được {addr}: {e}"))?;
-    eprintln!("f1stmuxd: nghe trên http://{addr}  (devtools: http://{addr}/devtools)");
+        .map_err(|e| format!("cannot bind {addr}: {e}"))?;
+    eprintln!("f1stmuxd: listening on http://{addr}  (devtools: http://{addr}/devtools)");
 
-    // ponytail: single-thread, xử lý tuần tự từng kết nối — đủ cho Termux RAM thấp,
-    // tránh toàn bộ vấn đề Send/Sync của DOM/QuickJS (Rc, không Send).
+    // ponytail: single-threaded, handles connections one at a time — enough for low-RAM
+    // Termux, and it sidesteps every Send/Sync problem in DOM/QuickJS (Rc is not Send).
     loop {
         let Ok((sock, _peer)) = listener.accept().await else { continue };
         let _ = handle(srv.clone(), sock).await;
@@ -102,19 +103,19 @@ async fn handle(srv: Arc<Server>, mut sock: tokio::net::TcpStream) -> Result<(),
 }
 
 async fn route(srv: &Arc<Server>, req: &Req) -> (&'static str, &'static str, String) {
-/// POST /challenge {session, post_url?, token_field?} → tạo ticket human-solve.
-/// post_url cho trước thì dùng thẳng, không thì auto-extract từ DOM của session.
+/// POST /challenge {session, post_url?, token_field?} → create a human-solve ticket.
+/// If post_url is given use it directly, otherwise auto-extract it from the session DOM.
 async fn challenge_create_http(srv: &Arc<Server>, body: &str) -> (&'static str, &'static str, String) {
     let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
     let sid = v.get("session").and_then(Value::as_str).unwrap_or("");
     let m = srv.sessions.lock().unwrap();
     let sess = match m.get(sid) {
         Some(s) => s,
-        None => return ("404 Not Found", "text/plain; charset=utf-8", "session không tồn tại".into()),
+        None => return ("404 Not Found", "text/plain; charset=utf-8", "session does not exist".into()),
     };
     let dom = match sess.dom.as_ref() {
         Some(d) => d.clone(),
-        None => return ("422 Unprocessable", "text/plain; charset=utf-8", "session chưa nạp trang nào".into()),
+        None => return ("422 Unprocessable", "text/plain; charset=utf-8", "session has no page loaded".into()),
     };
     let kind = sess.last.as_ref().and_then(|r| r.captcha.clone()).unwrap_or("manual".into());
     let page_url = sess.last.as_ref().map(|r| r.final_url.clone()).unwrap_or_default();
@@ -126,7 +127,7 @@ async fn challenge_create_http(srv: &Arc<Server>, body: &str) -> (&'static str, 
         },
         None => match crate::challenge::auto_extract(&dom.borrow(), &page_url) {
             Some(s) => s,
-            None => return ("422 Unprocessable", "text/plain; charset=utf-8", "không trích được form replay từ DOM".into()),
+            None => return ("422 Unprocessable", "text/plain; charset=utf-8", "could not auto-extract a replay form from the DOM".into()),
         },
     };
     drop(m);
@@ -135,8 +136,8 @@ async fn challenge_create_http(srv: &Arc<Server>, body: &str) -> (&'static str, 
     json(json!({"id": t.id, "portal_url": t.portal_url, "kind": t.kind}))
 }
 
-/// POST /challenge/:id/solution {token} (JSON hoặc urlencoded từ portal form)
-/// → replay vào session, trả {ok, url?, raw?}. Không bao giờ navigate tới đích.
+/// POST /challenge/:id/solution {token} (JSON or urlencoded from the portal form)
+/// → replay into the session, return {ok, url?, raw?}. Never navigates to the target.
 async fn challenge_solution_http(srv: &Arc<Server>, id: &str, body: &str) -> (&'static str, &'static str, String) {
     let token = serde_json::from_str::<Value>(body)
         .ok()
@@ -148,22 +149,22 @@ async fn challenge_solution_http(srv: &Arc<Server>, id: &str, body: &str) -> (&'
             })
         })
         .unwrap_or_default();
-    // URL-decode tối thiểu cho form portal (token thường là base64url, ít ký tự lạ).
+    // Minimal URL-decode for the portal form (the token is usually base64url, few special chars).
     let token = percent_decode(&token.replace('+', " "));
     let sess_id = match crate::challenge::lookup(&srv.challenges, id) {
         Some(t) => t.session.clone(),
-        None => return ("404 Not Found", "text/plain; charset=utf-8", "ticket không tồn tại".into()),
+        None => return ("404 Not Found", "text/plain; charset=utf-8", "ticket does not exist".into()),
     };
     let cfg = srv.config();
     let prof_name = cfg.profile.clone();
     let mut m = srv.sessions.lock().unwrap();
     let sess = match m.get_mut(sess_id.as_str()) {
         Some(s) => s,
-        None => return ("410 Gone", "text/plain; charset=utf-8", "session của ticket đã đóng".into()),
+        None => return ("410 Gone", "text/plain; charset=utf-8", "the ticket session has been closed".into()),
     };
     let prof = match crate::stealth::profile(&prof_name) {
         Some(p) => p,
-        None => return ("500 Internal", "text/plain; charset=utf-8", "profile cấu hình không tồn tại".into()),
+        None => return ("500 Internal", "text/plain; charset=utf-8", "the configured profile does not exist".into()),
     };
     match crate::challenge::solve(&srv.challenges, sess, &cfg, prof, id, &token).await {
         Ok(o) => json(serde_json::to_value(&o).unwrap_or(Value::Null)),
@@ -219,13 +220,13 @@ fn hex(c: Option<&u8>) -> Option<u8> {
         ));
     }
 
-    // ---- CDP cho DevTools ----
+    // ---- CDP for DevTools ----
     if req.path == "/cdp" && req.method == "POST" {
         let v: Value = serde_json::from_str(&req.body).unwrap_or(Value::Null);
         return json(cdp(srv, &v).await);
     }
 
-    // ---- Human-solve challenge portal (loopback, không log token) ----
+    // ---- Human-solve challenge portal (loopback, never logs the token) ----
     if req.path == "/challenge" && req.method == "POST" {
         return challenge_create_http(srv, &req.body).await;
     }
@@ -240,7 +241,7 @@ fn hex(c: Option<&u8>) -> Option<u8> {
                     ) / 1000;
                     ("200 OK", "text/html; charset=utf-8", crate::challenge::portal_page(&t, ttl))
                 }
-                None => ("404 Not Found", "text/plain; charset=utf-8", "ticket không tồn tại".into()),
+                None => ("404 Not Found", "text/plain; charset=utf-8", "ticket does not exist".into()),
             };
         }
         if tail == "solution" && req.method == "POST" {
@@ -249,7 +250,7 @@ fn hex(c: Option<&u8>) -> Option<u8> {
         if tail == "result" && req.method == "GET" {
             return match crate::challenge::lookup(&srv.challenges, id) {
                 Some(t) => json(json!({"id": t.id, "status": t.status, "url": t.url, "note": t.note})),
-                None => ("404 Not Found", "text/plain; charset=utf-8", "ticket không tồn tại".into()),
+                None => ("404 Not Found", "text/plain; charset=utf-8", "ticket does not exist".into()),
             };
         }
     }
@@ -275,19 +276,19 @@ fn hex(c: Option<&u8>) -> Option<u8> {
             "name": "F1stmux",
             "version": env!("CARGO_PKG_VERSION"),
             "endpoints": ["/rpc", "/cdp", "/devtools", "/json/version", "/json/list", "/health"],
-            "note": "không telemetry, không log mặc định. /devtools là DevTools thật."
+            "note": "no telemetry, no logging by default. /devtools is the real DevTools."
         }));
     }
 
-    ("404 Not Found", "text/plain; charset=utf-8", "không có endpoint này".into())
+    ("404 Not Found", "text/plain; charset=utf-8", "no such endpoint".into())
 }
 
 fn json(v: Value) -> (&'static str, &'static str, String) {
     ("200 OK", "application/json; charset=utf-8", v.to_string())
 }
 
-/// Xử lý lệnh CDP. Domain `F1stmux.*` là của ta; các domain DOM/Network còn lại
-/// trả về dữ liệu tương thích để frontend thật hiểu được.
+/// Handle a CDP command. The `F1stmux.*` domains are ours; the remaining DOM/Network
+/// domains return compatible data so a real frontend can understand it.
 async fn cdp(srv: &Arc<Server>, v: &Value) -> Value {
     let m = v.get("method").and_then(Value::as_str).unwrap_or("");
     let p = v.get("params").cloned().unwrap_or(json!({}));
@@ -325,7 +326,7 @@ async fn cdp(srv: &Arc<Server>, v: &Value) -> Value {
         "Browser.getVersion" => crate::inspector::version_json(),
         _ => {
             let _ = p;
-            return json!({"error": {"code": -32601, "message": format!("CDP method chưa hỗ trợ: {m}")}});
+            return json!({"error": {"code": -32601, "message": format!("unsupported CDP method: {m}")}});
         }
     };
     json!({"id": v.get("id").cloned().unwrap_or(Value::Null), "result": result})

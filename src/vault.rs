@@ -1,9 +1,11 @@
-//! Vault: profile mã hoá trên đĩa, khoá bằng passphrase của người dùng.
+//! Vault: an encrypted profile on disk, keyed by the user's passphrase.
 //!
-//! Passphrase không bao giờ chạm đĩa và không bao giờ được ghi log. MAC kiểm tra
-//! TRƯỚC khi giải mã — sai thì fail closed, không giải ra rác rồi báo parse error.
+//! The passphrase never touches disk and is never logged. The MAC is checked
+//! BEFORE decrypting — on mismatch it fails closed instead of decrypting garbage
+//! and then reporting a parse error.
 //!
-//! ⚠ KHÔNG phải mật mã production. Xem `ponytail:` ngay dưới để biết phải thay cái gì.
+//! ⚠ NOT production cryptography. See the `ponytail:` note right below for what
+//! has to be replaced.
 
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -14,13 +16,14 @@ use std::path::{Path, PathBuf};
 const B64: base64::engine::general_purpose::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
-/// Vòng lặp dẫn xuất khoá. Nhiều vòng = dò mật khẩu chậm hơn.
+/// Key derivation rounds. More rounds = slower password guessing.
 const KDF_ROUNDS: u32 = 50_000;
 
-// ponytail: băm bằng SipHash-1-3 64-bit của std và KHÔNG memory-hard (chỉ lặp CPU).
-// Nghĩa là dò passphrase bằng dictionary vẫn khả thi. Thay bằng `argon2` (Argon2id)
-// + `chacha20poly1305` (có sẵn trong crates.io) + kiểm tra bằng chuỗi hằng thời gian.
-// Đổi `format_version` lên 2 và giữ nguyên đường đọc cũ để migrate.
+// ponytail: hashing uses std's 64-bit SipHash-1-3 and is NOT memory-hard (CPU loops only).
+// That means dictionary-guessing the passphrase is still feasible. Replace with
+// `argon2` (Argon2id) + `chacha20poly1305` (both available on crates.io) + a
+// constant-time comparison. Bump `format_version` to 2 and keep the old read path
+// to migrate.
 
 #[derive(Serialize, Deserialize)]
 struct Header {
@@ -39,15 +42,15 @@ pub struct Vault {
 }
 
 impl Vault {
-    /// Mở (hoặc tạo mới nếu chưa có) vault. Sai passphrase chỉ lộ ra lúc `load()` —
-    /// lúc mở chưa có ciphertext để mà kiểm.
+    /// Open (or create if it does not exist yet) the vault. A wrong passphrase only
+    /// shows up at `load()` — at open time there is no ciphertext to check yet.
     pub fn open(path: &Path, passphrase: &str) -> Result<Self, String> {
         match std::fs::read(path) {
             Ok(raw) => {
                 let h: Header = serde_json::from_slice(&raw)
-                    .map_err(|e| format!("vault: {} hỏng: {e}", path.display()))?;
+                    .map_err(|e| format!("vault: {} is corrupt: {e}", path.display()))?;
                 if h.v != 1 {
-                    return Err(format!("vault: định dạng v{} không hỗ trợ", h.v));
+                    return Err(format!("vault: format v{} is not supported", h.v));
                 }
                 let salt = unb64::<SALT_LEN>(&h.salt)?;
                 let (enc, mac) = derive(passphrase, &salt);
@@ -63,7 +66,7 @@ impl Vault {
         }
     }
 
-    /// Ghi đè atomically (tmp + rename) và siết quyền file về 0600.
+    /// Write atomically (tmp + rename) and tighten the file mode to 0600.
     pub fn save(&self, data: &Value) -> Result<(), String> {
         let pt = serde_json::to_vec(data).map_err(|e| format!("vault: {e}"))?;
         let mut nonce = [0u8; NONCE_LEN];
@@ -106,7 +109,7 @@ impl Vault {
         Ok(())
     }
 
-    /// `Ok(Value::Null)` nếu vault còn trống (chưa có gì để giải mã).
+    /// `Ok(Value::Null)` if the vault is still empty (nothing to decrypt).
     pub fn load(&self) -> Result<Value, String> {
         let raw = match std::fs::read(&self.path) {
             Ok(r) => r,
@@ -114,32 +117,33 @@ impl Vault {
             Err(e) => return Err(format!("vault: {}: {e}", self.path.display())),
         };
         let h: Header =
-            serde_json::from_slice(&raw).map_err(|e| format!("vault: {} hỏng: {e}", self.path.display()))?;
+            serde_json::from_slice(&raw).map_err(|e| format!("vault: {} is corrupt: {e}", self.path.display()))?;
         if h.v != 1 {
-            return Err(format!("vault: định dạng v{} không hỗ trợ", h.v));
+            return Err(format!("vault: format v{} is not supported", h.v));
         }
         let salt = unb64::<SALT_LEN>(&h.salt)?;
         let nonce = unb64::<NONCE_LEN>(&h.nonce)?;
         let ct = B64
             .decode(h.ct.as_bytes())
-            .map_err(|e| format!("vault: ct hỏng: {e}"))?;
+            .map_err(|e| format!("vault: ct is corrupt: {e}"))?;
         let want = B64
             .decode(h.mac.as_bytes())
-            .map_err(|e| format!("vault: mac hỏng: {e}"))?;
+            .map_err(|e| format!("vault: mac is corrupt: {e}"))?;
 
-        // Fail closed: MAC sai thì dừng, không thử giải mã.
+        // Fail closed: a wrong MAC stops everything, no decryption is attempted.
         let got = mac_of(&self.mac, &nonce, &ct);
         if !ct_eq(&got, &want) {
-            return Err("vault: MAC sai (sai passphrase, hoặc file bị sửa)".into());
+            return Err("vault: wrong MAC (wrong passphrase, or the file was modified)".into());
         }
-        // Salt trong header phải khớp salt đã dẫn xuất khoá, nếu không MAC đã sai rồi.
+        // The salt in the header must match the salt the key was derived from,
+        // otherwise the MAC would already have been wrong.
         if salt != self.salt {
-            return Err("vault: salt không khớp".into());
+            return Err("vault: salt does not match".into());
         }
 
         let mut pt = ct;
         chacha20_xor(&self.enc, &nonce, &mut pt);
-        serde_json::from_slice(&pt).map_err(|e| format!("vault: plaintext hỏng: {e}"))
+        serde_json::from_slice(&pt).map_err(|e| format!("vault: plaintext is corrupt: {e}"))
     }
 }
 
@@ -155,7 +159,7 @@ fn digest(parts: &[&[u8]]) -> u64 {
     h.finish()
 }
 
-/// 32 byte từ 4 lần băm 64-bit với nhãn miền khác nhau (chống va chạm tiền tố).
+/// 32 bytes from four 64-bit hashes with different domain labels (prevents prefix collisions).
 fn widen(domain: &[u8], parts: &[&[u8]]) -> [u8; 32] {
     let mut out = [0u8; 32];
     for i in 0..4u8 {
@@ -168,7 +172,7 @@ fn widen(domain: &[u8], parts: &[&[u8]]) -> [u8; 32] {
     out
 }
 
-/// Khoá mã hoá + khoá MAC, tách miền bằng nhãn khác nhau.
+/// The encryption key + the MAC key, domain-separated with different labels.
 fn derive(pass: &str, salt: &[u8; SALT_LEN]) -> ([u8; 32], [u8; 32]) {
     let p = pass.as_bytes();
     let mut enc = [0u8; 32];
@@ -185,7 +189,7 @@ fn mac_of(mac_key: &[u8; 32], nonce: &[u8; NONCE_LEN], ct: &[u8]) -> [u8; 32] {
     widen(b"f1/tag", &[mac_key.as_slice(), nonce.as_slice(), ct])
 }
 
-/// So sánh thời gian hằng — tránh rò rỉ MAC qua thời gian.
+/// Constant-time comparison — avoids leaking the MAC through timing.
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -198,7 +202,7 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// ChaCha20 (RFC 8439) — keystream, không phải cipher xác thực
+// ChaCha20 (RFC 8439) — a keystream, not an authenticated cipher
 // ---------------------------------------------------------------------------
 
 fn ld32(b: &[u8], i: usize) -> u32 {
@@ -221,7 +225,7 @@ fn chacha20_xor(key: &[u8; 32], nonce: &[u8; NONCE_LEN], data: &mut [u8]) {
     for i in 0..3 {
         st[13 + i] = ld32(nonce, i * 4);
     }
-    let mut counter = 1u32; // RFC 8439: counter nằm ở từ 12, nonce chiếm 13..16
+    let mut counter = 1u32; // RFC 8439: the counter is word 12, the nonce takes 13..16
     let mut off = 0usize;
     while off < data.len() {
         st[12] = counter;
@@ -243,13 +247,13 @@ fn chacha20_xor(key: &[u8; 32], nonce: &[u8; NONCE_LEN], data: &mut [u8]) {
         off += n;
         counter = counter.wrapping_add(1);
         if counter == 0 {
-            return; // quá 256 GiB — không bao giờ tới, nhưng không được xoay vòng lại
+            return; // over 256 GiB — never reached, but must not wrap around
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// base64 cố định độ dài
+// fixed-length base64
 // ---------------------------------------------------------------------------
 
 fn b64<const N: usize>(x: &[u8; N]) -> String {
@@ -257,9 +261,9 @@ fn b64<const N: usize>(x: &[u8; N]) -> String {
 }
 
 fn unb64<const N: usize>(s: &str) -> Result<[u8; N], String> {
-    let v = B64.decode(s.as_bytes()).map_err(|e| format!("vault: base64 hỏng: {e}"))?;
+    let v = B64.decode(s.as_bytes()).map_err(|e| format!("vault: base64 is corrupt: {e}"))?;
     if v.len() != N {
-        return Err(format!("vault: base64 dài {}, cần {N}", v.len()));
+        return Err(format!("vault: base64 length is {}, expected {N}", v.len()));
     }
     let mut out = [0u8; N];
     out.copy_from_slice(&v);
@@ -285,17 +289,17 @@ mod tests {
     fn roundtrip_and_empty() {
         let p = tmp("rt");
         let v = Vault::open(&p, "sai-mot").unwrap();
-        assert_eq!(v.load().unwrap(), Value::Null, "vault mới thì rỗng");
+        assert_eq!(v.load().unwrap(), Value::Null, "a new vault is empty");
 
         let data = serde_json::json!({ "cookies": ["a=1", "b=2"], "ua": "x" });
         v.save(&data).unwrap();
         assert_eq!(v.load().unwrap(), data);
 
-        // Mở lại bằng cùng passphrase, salt phải lấy từ file.
+        // Reopen with the same passphrase; the salt comes from the file.
         let again = Vault::open(&p, "sai-mot").unwrap();
         assert_eq!(again.load().unwrap(), data);
 
-        // Mỗi lần save dùng nonce mới → ciphertext khác nhau dù plaintext giống nhau.
+        // Every save uses a new nonce → different ciphertext even for identical plaintext.
         v.save(&data).unwrap();
         let a = std::fs::read_to_string(&p).unwrap();
         v.save(&data).unwrap();
@@ -322,7 +326,7 @@ mod tests {
         Vault::open(&p, "k").unwrap().save(&serde_json::json!({ "n": 1 })).unwrap();
         let raw = std::fs::read_to_string(&p).unwrap();
         let mut h: Header = serde_json::from_str(&raw).unwrap();
-        // Sửa ciphertext mà giữ nguyên MAC.
+        // Modify the ciphertext while keeping the MAC.
         let mut ct = B64.decode(h.ct.as_bytes()).unwrap();
         ct[0] ^= 0xff;
         h.ct = B64.encode(&ct);
@@ -335,17 +339,17 @@ mod tests {
     #[test]
     fn passphrase_never_reaches_disk() {
         let p = tmp("nodisk");
-        Vault::open(&p, "khong-bao-mat-ve-dia").unwrap()
+        Vault::open(&p, "not-protected-on-disk").unwrap()
             .save(&serde_json::json!({ "k": "v" }))
             .unwrap();
         let raw = std::fs::read_to_string(&p).unwrap();
-        assert!(!raw.contains("khong-bao-mat-ve-dia"), "passphrase lộ trên đĩa");
+        assert!(!raw.contains("not-protected-on-disk"), "the passphrase leaked to disk");
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 
     #[test]
     fn chacha_matches_rfc8439_vector() {
-        // RFC 8439 §2.4.2: keystream đầu tiên cho key=0, nonce=0.
+        // RFC 8439 §2.4.2: the first keystream block for key=0, nonce=0.
         let key = [0u8; 32];
         let nonce = [0u8; 12];
         let mut data = [0u8; 64];

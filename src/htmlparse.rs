@@ -1,7 +1,7 @@
-//! Parse HTML5 bằng html5ever, xuất ra `Dom` của ta.
+//! Parse HTML5 with html5ever and output our `Dom`.
 //!
-//! html5ever sinh `RcDom` riêng. Ta duyệt nó một lần để dựng cây của mình —
-//! đổi lại ta sở hữu cây đó và bridge sang JS được sạch sẽ.
+//! html5ever produces its own `RcDom`. We walk it once to build our tree — in
+//! return we own that tree and bridging into JS stays clean.
 
 use crate::dom::Dom;
 use html5ever::tendril::TendrilSink;
@@ -16,7 +16,8 @@ pub struct Parsed {
     pub title: String,
 }
 
-/// Script theo đúng thứ tự xuất hiện: inline chạy code, external tải về rồi chạy.
+/// Scripts in the exact order they appear: inline runs the code, external is
+/// downloaded first and then run.
 #[derive(Debug, Clone)]
 pub enum PageScript {
     Inline(String),
@@ -44,8 +45,8 @@ pub fn parse(html: &str) -> Parsed {
             NodeData::Element { name, attrs, .. } => {
                 let id = dom.nodes.len();
                 let html_ns = Namespace::from(HTML_NS);
-                // Attr HTML không tiền tố mang namespace RỖNG (chỉ element mới có ns html).
-                // Lọc sai ở đây là rụng hết id/class/href/src.
+                // Unprefixed HTML attributes carry the EMPTY namespace (only elements
+                // have the html ns). Filtering wrongly here drops every id/class/href/src.
                 let attrs: Vec<(String, String)> = attrs
                     .borrow()
                     .iter()

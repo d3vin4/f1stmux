@@ -1,11 +1,12 @@
-//! F1stmux — headless browser cho AI, thiết kế Termux.
+//! F1stmux — a headless browser for AI, built for Termux.
 //!
-//! Binary duy nhất. `f1stmux` vừa là CLI vừa là daemon (subcommand `serve`).
+//! A single binary. `f1stmux` is both the CLI and the daemon (subcommand `serve`).
 //!
-//! Cam kết: không telemetry, không phone-home, không ghi log mặc định. Session
-//! mặc định chỉ tồn tại trong RAM — thoát là mất sạch dấu vết.
+//! Commitments: no telemetry, no phone-home, no logging by default. Sessions
+//! live in RAM only by default — exit and every trace is gone.
 
 pub mod blocklist;
+pub mod audit;
 pub mod challenge;
 pub mod cli;
 pub mod config;

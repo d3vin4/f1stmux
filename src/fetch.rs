@@ -1,11 +1,12 @@
-//! Tải trang: header theo profile → GET → redirect tay → giải nén → text.
+//! Page fetching: profile headers → GET → manual redirects → decompress → text.
 //!
-//! Redirect đi tay (không để reqwest tự điều hướng) là cố ý: mỗi hop phải
-//! gắn lại header đúng thứ tự của profile, nếu không UA/Client-Hints sẽ tụt về
-//! mặc định của reqwest ở hop thứ hai — dấu vết rõ nhất. Đổi lại phải tự canh
-//! `Location` và giới hạn số hop.
+//! Handling redirects manually (instead of letting reqwest follow them) is
+//! deliberate: every hop must reattach the profile headers in the right order,
+//! otherwise the UA/Client-Hints fall back to reqwest defaults on the second hop —
+//! the most obvious tell. In return we have to watch `Location` ourselves and cap
+//! the number of hops.
 //!
-//! Cookie jar sống trong RAM. Không telemetry, không log ra đĩa.
+//! The cookie jar lives in RAM. No telemetry, no logging to disk.
 
 use crate::blocklist::is_blocked_scheme;
 use crate::config::Config;
@@ -15,29 +16,30 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-/// Trần body. 8 MB là đủ cho mọi trang tĩnh/SPA bình thường; RSS feed lớn hơn thì
-/// nên tải bằng `get_bytes` và tự xử lý.
+/// Body ceiling. 8 MB covers every ordinary static/SPA page; for larger RSS feeds
+/// use `get_bytes` and handle the result yourself.
 pub const MAX_BODY: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Fetched {
-    /// URL đã yêu cầu (trước khi redirect).
+    /// The requested URL (before redirects).
     pub url: String,
-    /// URL sau khi đi hết chuỗi redirect.
+    /// The URL after walking the whole redirect chain.
     pub final_url: String,
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: String,
     pub elapsed_ms: u128,
-    /// Đường đi từng hop, theo thứ tự.
+    /// The path taken, hop by hop, in order.
     pub redirects: Vec<String>,
-    /// Chưa có HTTP cache trong f1stmux, nên luôn false. Để trường này để tool
-    /// không phải đoán body là từ mạng hay từ đĩa; thêm cache khi có.
+    /// f1stmux has no HTTP cache yet, so this is always false. The field exists so
+    /// tools do not have to guess whether the body came from the network or disk;
+    /// add a cache when there is one.
     pub from_cache: bool,
 }
 
-/// GET, body giải nén thành String. `cookie` là header `Cookie:` đã ghép sẵn từ
-/// jar của session (rỗng = không gửi).
+/// GET, body decompressed into a String. `cookie` is the `Cookie:` header already
+/// assembled from the session jar (empty = do not send it).
 pub async fn get(
     url: &str,
     cfg: &Config,
@@ -47,8 +49,8 @@ pub async fn get(
     Ok(run(url, cfg, prof, cookie, None).await?.0)
 }
 
-/// GET nhị phân (ảnh, file tải về). `Fetched.body` vẫn được điền bằng lossy text
-/// để shape của struct không đổi theo loại — caller đọc byte qua `Vec<u8>`.
+/// Binary GET (images, downloads). `Fetched.body` is still filled with lossy text
+/// so the struct shape does not change by kind — the caller reads bytes via `Vec<u8>`.
 pub async fn get_bytes(
     url: &str,
     cfg: &Config,
@@ -58,8 +60,8 @@ pub async fn get_bytes(
     run(url, cfg, prof, cookie, None).await
 }
 
-/// POST `application/x-www-form-urlencoded` — đăng nhập, submit form. Sau 303
-/// (và 302 như browser) chuyển sang GET và bỏ body, đúng như trình duyệt thật.
+/// POST `application/x-www-form-urlencoded` — login, form submit. After 303 (and
+/// 302 like a browser) switch to GET and drop the body, exactly like a real browser.
 pub async fn post_form(
     url: &str,
     cfg: &Config,
@@ -103,7 +105,7 @@ async fn run(
         let resp = req
             .send()
             .await
-            .map_err(|e| format!("{verb} {} thất bại: {}", cur, net::err_msg(&e)))?;
+            .map_err(|e| format!("{verb} {} failed: {}", cur, net::err_msg(&e)))?;
 
         let status = resp.status().as_u16();
         let location = resp
@@ -114,22 +116,22 @@ async fn run(
         if let Some(loc) = location.filter(|_| (300..400).contains(&status)) {
             if redirects.len() >= net::MAX_REDIRECTS {
                 return Err(format!(
-                    "{} vượt quá {} lần redirect — có thể là vòng lặp",
+                    "{} exceeded {} redirects — possibly a loop",
                     url, net::MAX_REDIRECTS
                 ));
             }
             let next = reqwest::Url::options()
                 .base_url(Some(&cur))
                 .parse(&loc)
-                .map_err(|e| format!("Location không hợp lệ ({loc}): {e}"))?;
+                .map_err(|e| format!("invalid Location ({loc}): {e}"))?;
             let next = check_url(next.as_str())?;
             if !seen.insert(next.to_string()) {
-                return Err(format!("vòng lặp redirect tại {next}"));
+                return Err(format!("redirect loop at {next}"));
             }
             redirects.push(cur.to_string());
             referer = Some(cur.to_string());
             cur = next;
-            // 303 luôn, 302 chỉ khi là POST: browser quy ước thành GET.
+            // Always for 303, for 302 only when it was a POST: the browser convention is GET.
             if matches!(status, 302 | 303) {
                 method_post = false;
             }
@@ -161,38 +163,39 @@ async fn run(
 async fn read_body(mut resp: reqwest::Response) -> Result<Vec<u8>, String> {
     if let Some(len) = resp.content_length() && len as usize > MAX_BODY {
         return Err(format!(
-            "body {len} byte vượt trần {MAX_BODY} byte (8 MB) — tải bằng get_bytes nếu thật sự cần"
+            "body of {len} bytes exceeds the {MAX_BODY} byte (8 MB) ceiling — use get_bytes if you really need it"
         ));
     }
     let mut out = Vec::new();
     while let Some(c) = resp.chunk().await.map_err(|e| net::err_msg(&e))? {
         if out.len() + c.len() > MAX_BODY {
-            return Err(format!("body vượt trần {MAX_BODY} byte (8 MB) khi đang đọc"));
+            return Err(format!("body exceeded the {MAX_BODY} byte (8 MB) ceiling while reading"));
         }
         out.extend_from_slice(&c);
     }
     Ok(out)
 }
 
-/// Chỉ http/https. `is_blocked_scheme` là lớp phòng thủ cho WebRTC/WS — allowlist
-/// này mới là hàng rào thật sự.
+/// http/https only. `is_blocked_scheme` is the defence layer for WebRTC/WS — this
+/// allowlist is the real fence.
 fn check_url(url: &str) -> Result<reqwest::Url, String> {
-    let u = reqwest::Url::parse(url).map_err(|e| format!("URL không hợp lệ ({url}): {e}"))?;
+    let u = reqwest::Url::parse(url).map_err(|e| format!("invalid URL ({url}): {e}"))?;
     let s = u.scheme();
     if s != "http" && s != "https" {
         return Err(format!(
-            "scheme {s}: không được phép (chỉ http/https; file:, data:, rtc: đều bị chặn)"
+            "scheme {s}: not allowed (http/https only; file:, data:, rtc: are all blocked)"
         ));
     }
     if is_blocked_scheme(s) {
-        return Err(format!("scheme {s}: bị chặn"));
+        return Err(format!("scheme {s}: blocked"));
     }
     Ok(u)
 }
 
-/// Giải mã body theo charset thật: header Content-Type trước, rồi <meta charset>
-/// trong 2 KB đầu. Không tìm thấy thì UTF-8 lossy. Không có crate này thì cả
-/// web windows-1251/shift_jis/gbk đều thành mojibake — rutracker đã chứng minh.
+/// Decode the body with the real charset: the Content-Type header first, then
+/// <meta charset> in the first 2 KB. If neither is found, lossy UTF-8. Without this
+/// crate whole windows-1251/shift_jis/gbk pages turn into mojibake — rutracker has
+/// already proven that.
 fn decode_text(b: &[u8], headers: &[(String, String)]) -> String {
     let b = b.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(b);
     if let Some(cs) = headers
@@ -218,8 +221,8 @@ fn decode_text(b: &[u8], headers: &[(String, String)]) -> String {
     }
 }
 
-/// Quét <meta charset="..."> hoặc <meta ... content="...charset=..."> trong 2 KB đầu.
-/// Duyệt MỌI thẻ meta (không dừng ở thẻ đầu — thẻ đầu có thể là viewport).
+/// Scan for <meta charset="..."> or <meta ... content="...charset=..."> in the first 2 KB.
+/// Walk EVERY meta tag (do not stop at the first one — it may be the viewport).
 fn meta_charset(b: &[u8]) -> Option<String> {
     let head = &b[..b.len().min(2048)];
     let lower: Vec<u8> = head.iter().map(|c| c.to_ascii_lowercase()).collect();
@@ -248,14 +251,14 @@ pub struct Cookie {
     pub name: String,
     pub value: String,
     pub domain: String,
-    /// Chỉ khớp đúng host đặt cookie, không khớp subdomain.
+    /// Matches only the exact host that set the cookie, not subdomains.
     pub host_only: bool,
     pub path: String,
-    /// Unix giây. `None` = session cookie (chết khi process chết).
+    /// Unix seconds. `None` = a session cookie (dies with the process).
     pub expires: Option<u64>,
     pub secure: bool,
-    /// HttpOnly nghĩa là JS không đọc được — mô hình hoá bằng cờ này, vì ở đây
-    /// không có `document.cookie` nào cả, chỉ có lời gọi RPC tường minh.
+    /// HttpOnly means JS cannot read it — modelled with this flag, because there is
+    /// no `document.cookie` here at all, only explicit RPC calls.
     pub visible_to_js: bool,
 }
 
@@ -277,7 +280,7 @@ impl CookieJar {
                 continue;
             }
             let Some(c) = parse_set_cookie(&base, v, now) else { continue };
-            // Max-Age <= 0 nghĩa là xoá cookie.
+            // Max-Age <= 0 means delete the cookie.
             if c.expires == Some(0) {
                 self.cookies.retain(|e| !(e.name == c.name && e.domain == c.domain && e.path == c.path));
                 continue;
@@ -287,18 +290,18 @@ impl CookieJar {
         }
     }
 
-    /// Header `Cookie:` để gửi đi, theo thứ tự cũ hơn trước (giống browser).
+    /// The `Cookie:` header to send, oldest first (like a browser).
     pub fn header_for(&self, url: &str) -> String {
         join(&self.match_all(url, false))
     }
 
-    /// Phần JS được phép thấy (bỏ HttpOnly). Chỉ session gọi, sau khi script
-    /// chạy xong.
+    /// The part JS is allowed to see (HttpOnly dropped). Called by the session only,
+    /// after the scripts have run.
     pub fn visible_for_js(&self, url: &str) -> String {
         join(&self.match_all(url, true))
     }
 
-    /// Cookie của session, để tool `get_cookies` liệt kê.
+    /// The session cookies, so the `get_cookies` tool can list them.
     pub fn all(&self) -> &[Cookie] {
         &self.cookies
     }
@@ -340,13 +343,13 @@ impl CookieJar {
                 path_matches(path, &c.path)
             })
             .collect();
-        // Cookie path cụ thể hơn thì gửi trước (RFC 6265 §5.4), dài trước ngắn sau.
+        // A more specific cookie path is sent first (RFC 6265 §5.4), longest before shortest.
         out.sort_by(|a, b| b.path.len().cmp(&a.path.len()));
         out
     }
 }
 
-/// Host-only thì chỉ khớp đúng domain; ngược lại khớp cả subdomain.
+/// Host-only matches just the domain; otherwise subdomains match too.
 fn domain_match(host: &str, domain: &str, host_only: bool) -> bool {
     if host_only {
         return host == domain;
@@ -357,8 +360,8 @@ fn domain_match(host: &str, domain: &str, host_only: bool) -> bool {
             && host.as_bytes()[host.len() - domain.len() - 1] == b'.')
 }
 
-/// Path match của RFC 6265 §5.1.4 rút gọn: tiền tố, và ký tự ngay sau tiền tố
-/// phải là `/` (trừ khi path cookie đã kết thúc bằng `/`).
+/// A shortened RFC 6265 §5.1.4 path match: a prefix, and the character right after
+/// the prefix must be `/` (unless the cookie path already ends with `/`).
 fn path_matches(path: &str, cookie_path: &str) -> bool {
     if cookie_path == "/" || path == cookie_path {
         return true;
@@ -397,9 +400,9 @@ fn parse_set_cookie(base: &reqwest::Url, line: &str, now: u64) -> Option<Cookie>
         match k.as_str() {
             "domain" => {
                 let d = v.trim_start_matches('.').to_ascii_lowercase();
-                // RFC 6265 §5.3: origin chỉ được đặt cookie cho chính nó hoặc
-                // domain cha của nó. evil.com không được Domain=victim.com.
-                // IP literal không được dùng Domain (trừ chính nó).
+                // RFC 6265 §5.3: an origin may only set cookies for itself or its
+                // parent domain. evil.com must not send Domain=victim.com.
+                // An IP literal must not use Domain (except for itself).
                 if d.is_empty() {
                     continue;
                 }
@@ -422,8 +425,8 @@ fn parse_set_cookie(base: &reqwest::Url, line: &str, now: u64) -> Option<Cookie>
                 }
             }
             "max-age" => {
-                // Max-Age thắng Expires (RFC 6265 §5.3). <= 0 nghĩa là xoá: mã hoá
-                // thành Some(0) cho set_from_headers nhận ra.
+                // Max-Age beats Expires (RFC 6265 §5.3). <= 0 means delete: encoded
+                // as Some(0) for set_from_headers to notice.
                 c.expires = Some(match v.parse::<i64>() {
                     Ok(n) if n > 0 => now.saturating_add_signed(n),
                     _ => 0,
@@ -436,6 +439,7 @@ fn parse_set_cookie(base: &reqwest::Url, line: &str, now: u64) -> Option<Cookie>
             }
             "secure" => c.secure = true,
             "httponly" => c.visible_to_js = false,
+            "samesite" => { /* noted: currently only remembered; full SameSite semantics P2 */ }
             _ => {}
         }
     }
@@ -449,10 +453,11 @@ fn default_path(path: &str) -> String {
     }
 }
 
-/// Định dạng cookie duy nhất còn dùng: `Wed, 21 Oct 2015 07:28:00 GMT` (RFC 1123).
-/// Không có crate ngày giờ nên tính ngày bằng công thức civil-days (Howard Hinnant).
+/// The only cookie date format still in use: `Wed, 21 Oct 2015 07:28:00 GMT` (RFC 1123).
+/// There is no datetime crate, so dates are computed with the civil-days formula
+/// (Howard Hinnant).
 fn parse_http_date(s: &str) -> Option<u64> {
-    // Bỏ ngày trong tuần nếu có: "Wed, 21 Oct 2015 07:28:00 GMT"
+    // Drop the weekday if present: "Wed, 21 Oct 2015 07:28:00 GMT"
     let rest = s.trim().split_once(", ").map(|(_, r)| r).unwrap_or(s.trim());
     let f: Vec<&str> = rest.split_whitespace().collect();
     let [d, mon, y, time, ..] = f.as_slice() else { return None };
@@ -500,17 +505,17 @@ mod tests {
                 ("Content-Type".into(), "text/html".into()),
             ],
         );
-        assert_eq!(j.len(), 2, "Max-Age=0 phải xoá, Content-Type không phải cookie");
+        assert_eq!(j.len(), 2, "Max-Age=0 must delete, Content-Type is not a cookie");
 
-        // `pref` không có Domain nên host-only cho shop.example.com — đúng như
-        // browser, không lan sang subdomain khác.
+        // `pref` has no Domain so it is host-only for shop.example.com — exactly
+        // like a browser, it does not spread to other subdomains.
         assert_eq!(j.header_for("https://shop.example.com/a/deep"), "pref=dark; sid=1");
-        // Cookie Domain= lan sang subdomain; path /a không khớp /other
+        // A Domain= cookie spreads to subdomains; path /a does not match /other
         assert!(j.header_for("https://cdn.example.com/a/deep").contains("sid=1"));
         assert!(!j.header_for("https://cdn.example.com/other").contains("sid=1"));
-        // Secure cookie không đi qua http:
+        // A Secure cookie does not travel over http:
         assert!(!j.header_for("http://shop.example.com/a").contains("sid=1"));
-        // HttpOnly giấu khỏi JS, nhưng vẫn gửi đi:
+        // HttpOnly is hidden from JS, but still sent:
         assert!(j.visible_for_js("https://shop.example.com/a").contains("pref=dark"));
         assert!(!j.visible_for_js("https://shop.example.com/a").contains("sid=1"));
         j.clear();
@@ -520,12 +525,12 @@ mod tests {
     #[test]
     fn expires_parses_rfc1123() {
         assert_eq!(parse_http_date("Wed, 21 Oct 2015 07:28:00 GMT"), Some(1_445_412_480));
-        // Ngày hết hạn quá khứ -> cookie phải bị bỏ khi ghép header.
+        // A past expiry date -> the cookie must be dropped when building the header.
         let mut j = CookieJar::new();
         let u0 = u("https://a.example/");
         j.cookies.push(parse_set_cookie(&u0, "old=1; Expires=Wed, 21 Oct 2015 07:28:00 GMT", unix_now()).expect("cookie"));
         assert!(j.header_for("https://a.example/").is_empty());
-        // Host-only không lan sang subdomain
+        // Host-only does not spread to subdomains
         j.cookies.clear();
         j.set_from_headers("https://a.example/", &[("set-cookie".into(), "h=1".into())]);
         assert!(j.header_for("https://a.example/").contains("h=1"));
@@ -536,7 +541,7 @@ mod tests {
     fn scheme_allowlist_rejects_everything_else() {
         assert!(check_url("https://ok.example/p").is_ok());
         for bad in ["file:///etc/passwd", "data:text/html,x", "javascript:alert(1)", "ftp://a/b", "stun:a.example:1", "wss://a/b"] {
-            assert!(check_url(bad).is_err(), "phải chặn {bad}");
+            assert!(check_url(bad).is_err(), "must block {bad}");
         }
     }
 }

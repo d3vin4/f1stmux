@@ -1,24 +1,24 @@
-//! Cấu hình. Mọi thứ mặc định là riêng tư: không log, không persist, DoH bật.
+//! Configuration. Everything defaults to private: no logs, no persistence, DoH on.
 
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    /// Cổng JSON-RPC. Mặc định chỉ bind localhost — không ai ngoài máy này gọi được.
+    /// JSON-RPC port. Defaults to localhost only — nothing outside this machine can call it.
     pub listen: String,
     pub profile: String,
-    /// Đường dẫn profile mã hoá. None = không lưu gì cả (mặc định).
+    /// Path to the encrypted profile store. None = store nothing (the default).
     pub vault: Option<String>,
     pub proxy: Option<String>,
     pub doh: String,
     pub max_tabs: usize,
     pub max_ram_mb: usize,
-    /// Tắt mọi hook plugin mà không cần uninstall.
+    /// Disable every plugin hook without uninstalling.
     pub kill_switch: bool,
-    /// Cho phép session ghi cookie/storage xuống đĩa. Mặc định false.
+    /// Allow the session to write cookies/storage to disk. Defaults to false.
     pub persist: bool,
-    /// Cho phép bind địa chỉ không phải loopback. Mặc định false: daemon không
-    /// auth nên bind remote mà không tường minh là tự mở cửa cho cả mạng.
+    /// Allow binding a non-loopback address. Defaults to false: the daemon has no
+    /// auth, so binding a remote address without saying so is opening the door to the whole network.
     pub allow_remote: bool,
 }
 
@@ -40,25 +40,25 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Đọc config, sau đó cho phép override từ config file.
-    /// Không bao giờ tự ghi file — người dùng kiểm soát, không có phone-home.
-    /// File lỗi thì BÁO ra stderr chứ không lặng lẽ dùng default (trước đây lỗi
-    /// parse là rơi về default mà không ai biết — gồm cả lỗi bảo mật).
+    /// Read the config, then allow overrides from the config file.
+    /// Never writes a file on its own — the user stays in control, no phone-home.
+    /// A broken file is REPORTED on stderr instead of silently falling back to
+    /// defaults (previously a parse error fell back silently — including security errors).
     pub fn load(path: Option<&std::path::Path>) -> Self {
         let mut cfg = Config::default();
         if let Some(p) = path {
             match std::fs::read_to_string(p) {
                 Ok(s) => match serde_json::from_str::<Config>(&s) {
                     Ok(v) => cfg = v,
-                    Err(e) => eprintln!("cảnh báo: config {} lỗi parse ({e}), dùng mặc định", p.display()),
+                    Err(e) => eprintln!("warning: config {} failed to parse ({e}), using defaults", p.display()),
                 },
-                Err(e) => eprintln!("cảnh báo: không đọc được config {} ({e}), dùng mặc định", p.display()),
+                Err(e) => eprintln!("warning: cannot read config {} ({e}), using defaults", p.display()),
             }
         }
         cfg
     }
 
-    /// true nếu listen trỏ ra ngoài loopback.
+    /// true if listen points outside loopback.
     pub fn is_remote_bind(&self) -> bool {
         let addr = self.listen.trim();
         let host = if let Some(rest) = addr.strip_prefix('[') {

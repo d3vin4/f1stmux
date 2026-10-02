@@ -1,5 +1,5 @@
-//! Realm QuickJS: cài `__f1host` (bridge sang DOM của Rust), nạp lớp vờ DOM,
-//! rồi chạy script của trang và script của plugin.
+//! QuickJS realm: install `__f1host` (the bridge into Rust's DOM), load the fake DOM
+//! layer, then run the page scripts and the plugin scripts.
 
 use crate::dom::Dom;
 use rquickjs::{Context, Ctx, Function, Object, Runtime, Value};
@@ -9,7 +9,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-/// Kết quả chạy JS trên trang.
+/// The result of running JS on the page.
 #[derive(Debug, Default)]
 pub struct JsOut {
     pub console: Vec<(String, String)>,
@@ -32,8 +32,8 @@ pub struct Realm {
     steps: Arc<AtomicUsize>,
 }
 
-/// Storage của đúng một session — không còn global thread-local dùng chung.
-/// Session sở hữu map này và truyền clone vào mỗi Realm nó tạo.
+/// Storage for exactly one session — no more shared global thread-local.
+/// The session owns this map and passes a clone into every Realm it creates.
 pub type SessionStore = Rc<RefCell<HashMap<String, String>>>;
 
 pub fn new_store() -> SessionStore {
@@ -47,7 +47,7 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Thông tin môi trường JS — owned String, không Box::leak.
+/// JS environment info — owned Strings, no Box::leak.
 pub struct Env {
     pub ua: String,
     pub platform: String,
@@ -65,8 +65,9 @@ impl Realm {
         let rt = Runtime::new()?;
         rt.set_memory_limit(128 * 1024 * 1024);
         rt.set_max_stack_size(4 * 1024 * 1024);
-        // Interrupt handler thật: QuickJS gọi định kỳ trong eval; trả true là dừng.
-        // Đây mới là ngân sách bước/thời gian có răng — MAX_STEPS trước đây chỉ là hằng số treo.
+        // A real interrupt handler: QuickJS calls it periodically during eval;
+        // returning true stops it. This is what actually enforces the step/time
+        // budget — MAX_STEPS used to be a constant hanging on nothing.
         let deadline_ms = Arc::new(AtomicU64::new(now_ms() + 10_000));
         let steps = Arc::new(AtomicUsize::new(0));
         {
@@ -82,8 +83,8 @@ impl Realm {
         let errors = Rc::new(RefCell::new(Vec::new()));
         let timers = Rc::new(RefCell::new(0usize));
 
-        // Copy ra khỏi `e` để closure trong `with` không mượn `e`.
-        // (Trước đây Box::leak chuỗi ở caller — rò rỉ vĩnh viễn mỗi navigation.)
+        // Copy out of `e` so the closures inside `with` do not borrow `e`.
+        // (Previously the caller Box::leak the strings — a permanent leak per navigation.)
         let (ua, platform, conc, mem, sw, sh, title, url, cookie, tz) = (
             e.ua.clone(), e.platform.clone(), e.concurrency, e.device_memory,
             e.screen.0 as f64, e.screen.1 as f64,
@@ -180,8 +181,9 @@ impl Realm {
             host.set("screenH", Function::new(ctx.clone(), move || sh)?)?;
             host.set("timezone", Function::new(ctx.clone(), move || tz.to_string())?)?;
 
-            // Storage: không trả Object từ function (rquickjs lifetime invariant).
-            // Expose 4 hàm nguyên thủy; dom.js bọc thành localStorage/sessionStorage.
+            // Storage: do not return an Object from a function (rquickjs lifetime
+            // invariant). Expose 4 primitive functions; dom.js wraps them into
+            // localStorage/sessionStorage.
             host.set("storageGet", Function::new(ctx.clone(), {
                 let s = store.clone();
                 move |k: String| s.borrow().get(&k).cloned()
@@ -229,16 +231,16 @@ impl Realm {
         })
     }
 
-    /// Đặt lại ngân sách JS (ms kể từ giờ) cho cả Instant field lẫn interrupt handler.
-    /// Dùng để nối `budget_ms` của client vào — deadline cứng 10s trước đây bỏ qua nó.
+    /// Reset the JS budget (ms from now) for both the Instant field and the interrupt handler.
+    /// Used to wire in the client `budget_ms` — the previous hard 10s deadline ignored it.
     pub fn set_deadline_ms(&mut self, budget_ms: u64) {
         let budget_ms = budget_ms.clamp(500, 120_000);
         self.deadline = std::time::Instant::now() + std::time::Duration::from_millis(budget_ms);
         self.deadline_ms.store(now_ms() + budget_ms, Ordering::Relaxed);
     }
 
-    /// Chạy script. Lỗi được thu thập kèm message+stack thật (qua String()),
-    /// không làm sập — trang hỏng vẫn đọc được phần còn lại.
+    /// Run a script. Errors are collected with the real message+stack (via String()),
+    /// it does not crash — a broken page stays readable for the rest.
     pub fn run(&self, src: &str, tag: &str) {
         let r: rquickjs::Result<()> = self.ctx.with(|c| c.eval::<Value, _>(src).map(|_| ()));
         if r.is_err() {
@@ -256,12 +258,12 @@ impl Realm {
         }
     }
 
-    /// Chạy script, trả về JSON. Script phải tự `JSON.stringify`.
-    /// Chạy expression, giữ nguyên kiểu JS (number/bool/array/object).
-    /// Throw → Err(message + stack), không nuốt thành null nữa.
+    /// Run a script and return JSON. The script must `JSON.stringify` itself.
+    /// Runs an expression, preserving the JS type (number/bool/array/object).
+    /// Throw → Err(message + stack), no longer swallowed into null.
     pub fn eval_json(&self, src: &str) -> Result<serde_json::Value, String> {
-        // `src` là expression (giống DevTools console). try/catch bọc trong nên
-        // an toàn với expression; statement không giá trị trả về Null.
+        // `src` is an expression (like the DevTools console). The try/catch wrapper
+        // makes that safe; a statement with no value returns Null.
         let arg = serde_json::to_string(src).unwrap_or_default();
         let wrapped = format!(
             "JSON.stringify((function(__s){{ try {{ return {{ok:(0,eval(__s))}}; }} catch(e) {{ return {{err:String((e&&e.message?e.message+'\\n':'')+((e&&e.stack)||e))}}; }} }})({arg}))"
@@ -269,11 +271,11 @@ impl Realm {
         let s: Result<String, _> = self.ctx.with(|c| c.eval(wrapped));
         let s = match s {
             Ok(s) => s,
-            // Phân biệt interrupt/timeout với "expression không giá trị":
-            // stringify(undefined) cũng Err, nhưng ngân sách vượt là lỗi thật.
+            // Distinguish interrupt/timeout from "the expression has no value":
+            // stringify(undefined) also errors, but blowing the budget is a real error.
             Err(e) => {
                 if self.expired() || self.steps.load(Ordering::Relaxed) > MAX_STEPS {
-                    return Err(format!("JS vượt ngân sách (vòng lặp vô hạn hoặc quá nặng): {e}"));
+                    return Err(format!("JS exceeded the budget (infinite loop or too heavy): {e}"));
                 }
                 return Ok(serde_json::Value::Null);
             }

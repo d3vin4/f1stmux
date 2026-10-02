@@ -1,15 +1,15 @@
-//! Blocklist — chặn tracker/ad và WebRTC ở tầng request.
+//! Blocklist — blocks trackers/ads and WebRTC at the request layer.
 //!
-//! Cố ý nhỏ: bốn dạng rule, một parser, không phải engine AdGuard đầy đủ.
-//! Một engine ABP đúng nghĩa là hàng nghìn dòng cho thứ mà 60 domain + vài rule
-//! path đã cắt được phần lớn rủi ro. Thêm khi thật sự cần, không thêm trước.
+//! Deliberately small: four rule forms, one parser, not a full AdGuard engine.
+//! A real ABP engine means thousands of lines for something 60 domains + a few path
+//! rules already cut most of the risk. Add more when it is genuinely needed, not before.
 //!
-//! Dạng rule được hỗ trợ (và chỉ bốn):
-//! - `||host^`      khớp host và mọi subdomain của nó
-//! - `|http://`     khớp tiền tố scheme của URL
-//! - `/ads/`        khớp chuỗi con trong path
-//! - `@@` + một trong ba dạng trên = allowlist, thắng mọi rule chặn.
-//! Dòng rỗng, `#`/`!` là comment. Dòng không khớp dạng nào bị bỏ qua.
+//! Supported rule forms (and only four):
+//! - `||host^`      matches the host and all of its subdomains
+//! - `|http://`     matches the URL scheme prefix
+//! - `/ads/`        matches a substring inside the path
+//! - `@@` + one of the three forms above = allowlist, beats every block rule.
+//! Empty lines and `#`/`!` are comments. Lines matching no form are ignored.
 
 use serde::{Deserialize, Serialize};
 
@@ -31,16 +31,16 @@ pub enum ResourceKind {
 pub enum Decision {
     Allow,
     Block { rule: String },
-    /// Chặn nhưng trả về payload rỗng từ cache nội bộ với kích thước cho trước.
+    /// Blocked but return an empty payload from an internal cache with a preallocated size.
     Redirect(u64),
 }
 
-/// Scheme bị chặn: WebRTC (stun/turn/rtc) và WebSocket (ws/wss).
+/// Blocked schemes: WebRTC (stun/turn/rtc) and WebSocket (ws/wss).
 ///
-/// WebRTC không có API nào lộ ra cho JS ở đây, nên đây là lớp phòng thủ cuối: nếu
-/// một tầng khác (plugin, script tự dựng) tạo URL `stun:`/`wss:`, nó dừng ở đây.
-/// `file:`/`data:`/`javascript:` không cần khoá ở đây — allowlist http/https của
-/// `fetch` đã lo rồi.
+/// WebRTC exposes no API to JS here, so this is the last line of defence: if
+/// another layer (a plugin, a self-built script) creates a `stun:`/`wss:` URL, it
+/// stops here. `file:`/`data:`/`javascript:` need no lock here — the http/https
+/// allowlist in `fetch` already covers them.
 pub fn is_blocked_scheme(scheme: &str) -> bool {
     matches!(scheme, "stun" | "stuns" | "turn" | "turns" | "rtc" | "ws" | "wss")
 }
@@ -71,7 +71,7 @@ impl Rule {
     }
 }
 
-/// `a.example.com` khớp `example.com` và `www.example.com`, nhưng không khớp
+/// `a.example.com` matches `example.com` and `www.example.com`, but does not match
 /// `notexample.com`.
 fn domain_match(host: &str, domain: &str) -> bool {
     host == domain
@@ -80,8 +80,8 @@ fn domain_match(host: &str, domain: &str) -> bool {
             && host.as_bytes()[host.len() - domain.len() - 1] == b'.')
 }
 
-/// Parse một dòng rule. `None` = comment hoặc không thuộc bốn dạng hỗ trợ.
-/// Công khai để tool nạp rule có thể báo dòng nào sai trước khi nuốt im lặng.
+/// Parse one rule line. `None` = a comment or not one of the four supported forms.
+/// Public so a rule-loading tool can report which line is wrong instead of swallowing it.
 pub fn parse_rule(line: &str) -> Option<Rule> {
     let s = line.trim();
     if s.is_empty() || s.starts_with('#') || s.starts_with('!') {
@@ -89,7 +89,7 @@ pub fn parse_rule(line: &str) -> Option<Rule> {
     }
     let s = s.strip_prefix("@@").unwrap_or(s).trim();
     if let Some(host) = s.strip_prefix("||") {
-        // `^` trong ABP là separator, không phải ký tự cần khớp.
+        // In ABP, `^` is a separator, not a character to match.
         let host = host.trim_end_matches('^').trim().to_ascii_lowercase();
         (!host.is_empty()).then_some(Rule::Host(host))
     } else if let Some(prefix) = s.strip_prefix('|') {
@@ -113,8 +113,8 @@ impl Blocklist {
         Self::default()
     }
 
-    /// Nạp rule từ text (mỗi dòng một rule). Dòng lỗi bị bỏ qua — không có kênh
-    /// báo lỗi ở đây; nếu cần kiểm tra thì gọi `parse_rule` trước.
+    /// Load rules from text (one rule per line). Bad lines are skipped — there is no
+    /// error channel here; if you need validation, call `parse_rule` first.
     pub fn add_rules(&mut self, src: &str) {
         for line in src.lines() {
             if let Some(rule) = parse_rule(line) {
@@ -137,18 +137,19 @@ impl Blocklist {
         self.block.clear();
     }
 
-    /// Quyết định cho một URL. Thứ tự: scheme bị cấm → allowlist → rule chặn →
-    /// policy mặc định (tracker/ad ở dạng script hoặc XHR).
+    /// Decide for one URL. Order: banned scheme → allowlist → block rule →
+    /// default policy (trackers/ads as script or XHR).
     ///
-    /// Policy mặc định KHÔNG chặn `Document`: chặn nó thì trình duyệt chỉ ra
-    /// trang trắng, mà người dùng cần nhìn trang để tự quyết có chặn tiếp không.
-    /// Tải tracker vẫn xảy ra ở tài nguyên phụ — đó là đánh đổi đã chọn.
+    /// The default policy does NOT block `Document`: blocking it would just show a
+    /// blank page, while the user needs to see the page to decide for themselves
+    /// whether to block further. Tracker downloads still happen for subresources —
+    /// that is the accepted trade-off.
     pub fn decide(&self, url: &str, kind: ResourceKind) -> Decision {
         let Ok(u) = reqwest::Url::parse(url) else {
-            return Decision::Block { rule: format!("URL không phân giải được: {url}") };
+            return Decision::Block { rule: format!("URL could not be parsed: {url}") };
         };
         if is_blocked_scheme(u.scheme()) {
-            return Decision::Block { rule: format!("scheme bị cấm: {}:", u.scheme()) };
+            return Decision::Block { rule: format!("banned scheme: {}:", u.scheme()) };
         }
         if self.allow.iter().any(|e| e.rule.hits(&u)) {
             return Decision::Allow;
@@ -158,15 +159,15 @@ impl Blocklist {
         }
         let host = u.host_str().unwrap_or("").to_ascii_lowercase();
         if matches!(kind, ResourceKind::Script | ResourceKind::Xhr) && is_tracker(&host) {
-            return Decision::Block { rule: format!("tracker mặc định: {host}") };
+            return Decision::Block { rule: format!("default tracker: {host}") };
         }
         Decision::Allow
     }
 }
 
-/// Danh sách tracker mặc định. Không phải EasyPrivacy — chỉ những domain đo được
-/// là phần lớn đòn bẩy fingerprint/ads trên web phổ biến. Danh sách đầy đủ nên
-/// là file do người dùng nạp qua `add_rules`, không nhúng trong binary.
+/// The default tracker list. Not EasyPrivacy — only the domains measured to carry
+/// most of the fingerprinting/ads leverage on the common web. A full list should be
+/// a file the user loads via `add_rules`, not embedded in the binary.
 pub const TRACKERS: &[&str] = &[
     "doubleclick.net", "googlesyndication.com", "googleadservices.com", "googletagservices.com",
     "google-analytics.com", "analytics.google.com", "googletagmanager.com",
@@ -200,9 +201,9 @@ mod tests {
     fn tracker_script_blocked_but_document_allowed() {
         assert!(matches!(d("https://www.google-analytics.com/collect?v=1", ResourceKind::Xhr), Decision::Block { .. }));
         assert!(matches!(d("https://www.google-analytics.com/collect", ResourceKind::Document), Decision::Allow));
-        // Subdomain + 1-hop redirect sang domain khác vẫn bị chặn.
+        // A subdomain plus a 1-hop redirect to another domain is still blocked.
         assert!(matches!(d("https://a.b.doubleclick.net/pixel", ResourceKind::Script), Decision::Block { .. }));
-        // Ảnh thì để qua (nhiều site dùng domain tên trùng tracker).
+        // Images pass through (many sites use domains that sound like trackers).
         assert!(matches!(d("https://connect.facebook.net/x.png", ResourceKind::Image), Decision::Allow));
     }
 
@@ -225,7 +226,7 @@ mod tests {
         let mut b = Blocklist::new();
         b.add_rules("/ads/\n");
         assert!(matches!(b.decide("https://cdn.example/a/ads/b.js", ResourceKind::Script), Decision::Block { .. }));
-        // "downloads" chứa chuỗi "ads" — đây là lý do giữ cả hai dấu "/" trong rule.
+        // "downloads" contains the substring "ads" — that is why the rule keeps both "/" characters.
         assert!(matches!(b.decide("https://cdn.example/downloads/x.zip", ResourceKind::Other), Decision::Allow));
 
         let mut b = Blocklist::new();

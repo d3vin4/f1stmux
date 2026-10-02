@@ -1,11 +1,13 @@
-//! Plugin: cài bất cứ thứ gì (tool, inspector, parser, agent, proxy, hook) mà không sửa core.
+//! Plugins: install anything (tool, inspector, parser, agent, proxy, hook) without
+//! touching the core.
 //!
-//! Ba kiểu — `js` (trong realm QuickJS), `proc` (subprocess) — cùng nói chuyện JSON-lines.
-//! KHÔNG BAO GIỜ nạp dylib: dylib là ràng buộc ABI (vỡ mỗi lần bump version của crate) và
-//! một bug trong plugin sẽ giết luôn cả daemon thay vì chỉ chết một tiến trình con.
+//! Two kinds — `js` (inside a QuickJS realm), `proc` (subprocess) — both speaking
+//! JSON-lines. NEVER load a dylib: a dylib is an ABI constraint (it breaks on every
+//! crate version bump) and a bug in a plugin would take down the whole daemon instead
+//! of just one child process.
 //!
-//! Quyền được ép LÚC CHẠY, không chỉ lúc nạp: `PluginCtx` ghi vào `violations` mỗi lần
-//! plugin gọi thứ nó không được phép.
+//! Permissions are enforced at RUN TIME, not only at load: `PluginCtx` records an
+//! entry in `violations` every time a plugin calls something it is not allowed to.
 
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -19,12 +21,12 @@ use std::time::{Duration, Instant};
 
 use crate::jsenv::Realm;
 
-/// Phiên bản API plugin mà host này hiểu. Manifest khai báo cao hơn là bị từ chối.
+/// The plugin API version this host understands. A manifest declaring a higher one is rejected.
 pub const CURRENT_API_VERSION: u32 = 1;
-/// Tên file manifest trong thư mục plugin.
+/// The manifest filename inside a plugin directory.
 pub const MANIFEST_FILE: &str = "plugin.json";
 
-/// Lớp vờ JS cho plugin, đọc từ đĩa lúc nạp (`include_str` — không có I/O lúc chạy).
+/// The JS shell for plugins, read from disk at compile time (`include_str` — no I/O at run time).
 pub const PLUGIN_API_JS: &str = include_str!("../assets/plugin-api.js");
 
 // ---------------------------------------------------------------------------
@@ -34,11 +36,11 @@ pub const PLUGIN_API_JS: &str = include_str!("../assets/plugin-api.js");
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PluginKind {
-    /// Chạy trong realm QuickJS của host.
+    /// Runs inside the host's QuickJS realm.
     Js,
-    /// Chạy như subprocess, giao tiếp JSON-lines trên stdin/stdout.
+    /// Runs as a subprocess, talking JSON-lines over stdin/stdout.
     Proc,
-    /// Cần runtime wasm — chưa có crate, nên chạy sẽ báo lỗi rõ ràng.
+    /// Needs a wasm runtime — no crate yet, so running it reports a clear error.
     Wasm,
 }
 
@@ -143,7 +145,7 @@ impl Hook {
         ALL_HOOKS.iter().copied().find(|h| h.as_str() == s)
     }
 
-    /// Biểu tên nhận từ `plugin.on(...)` trong JS (thân thiện hơn cho plugin author).
+    /// The alias accepted from `plugin.on(...)` in JS (friendlier for plugin authors).
     pub fn from_js_name(s: &str) -> Option<Self> {
         Self::from_name(s).or_else(|| match s {
             "domReady" => Some(Self::OnDomReady),
@@ -163,12 +165,12 @@ pub struct Manifest {
     pub version: String,
     pub kind: PluginKind,
     pub entry: String,
-    /// Phiên bản API plugin cần. Cao hơn `CURRENT_API_VERSION` là từ chối.
+    /// The plugin API version needed. Higher than `CURRENT_API_VERSION` is rejected.
     #[serde(default = "default_api")]
     pub api: u32,
     #[serde(default)]
     pub permissions: Vec<Permission>,
-    /// Chấp nhận cả `["onRequest"]` lẫn `{"onRequest": 1}` (map = hook → priority).
+    /// Accepts both `["onRequest"]` and `{"onRequest": 1}` (map = hook → priority).
     #[serde(default, deserialize_with = "hooks_from_any")]
     pub hooks: Vec<Hook>,
 }
@@ -192,7 +194,7 @@ fn hooks_from_any<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Hook>, D
             for k in m.keys() {
                 match Hook::from_name(k) {
                     Some(h) => out.push(h),
-                    None => return Err(serde::de::Error::custom(format!("hook lạ: {k}"))),
+                    None => return Err(serde::de::Error::custom(format!("unknown hook: {k}"))),
                 }
             }
             out.sort_by_key(|h| *h as u8);
@@ -202,53 +204,53 @@ fn hooks_from_any<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Hook>, D
 }
 
 impl Manifest {
-    /// Chỉ kiểm tra cấu trúc. Dùng [`Manifest::validate_at`] để kiểm tra cả file entry.
+    /// Check the structure only. Use [`Manifest::validate_at`] to also check the entry file.
     pub fn validate(&self) -> Result<(), String> {
         if !valid_id(&self.id) {
             return Err(format!(
-                "plugin id không hợp lệ: {:?} (cần ^[a-z0-9][a-z0-9._-]{{0,63}}$)",
+                "invalid plugin id: {:?} (must match ^[a-z0-9][a-z0-9._-]{{0,63}}$)",
                 self.id
             ));
         }
         if self.name.trim().is_empty() {
-            return Err("thiếu name".into());
+            return Err("missing name".into());
         }
         if self.version.trim().is_empty() {
-            return Err("thiếu version".into());
+            return Err("missing version".into());
         }
         if self.entry.trim().is_empty() {
-            return Err("thiếu entry".into());
+            return Err("missing entry".into());
         }
         let e = Path::new(&self.entry);
         if e.is_absolute() || e.components().any(|c| c.as_os_str() == "..") {
-            return Err(format!("entry phải là đường dẫn tương đối trong thư mục plugin: {:?}", self.entry));
+            return Err(format!("entry must be a relative path inside the plugin directory: {:?}", self.entry));
         }
         if self.api > CURRENT_API_VERSION {
             return Err(format!(
-                "plugin cần api {} > {} (host quá cũ, nâng f1stmux)",
+                "plugin needs api {} > {} (the host is too old, upgrade f1stmux)",
                 self.api, CURRENT_API_VERSION
             ));
         }
         if self.api == 0 {
-            return Err("api phải >= 1".into());
+            return Err("api must be >= 1".into());
         }
         if self.hooks.is_empty() && self.kind != PluginKind::Js {
-            return Err("plugin không hook thì chẳng làm gì — khai báo ít nhất 1 hook".into());
+            return Err("a plugin with no hooks does nothing — declare at least 1 hook".into());
         }
         Ok(())
     }
 
-    /// Kiểm tra cấu trúc + entry có thật sự nằm trong `dir` không (chặn path escape).
+    /// Check the structure + that the entry really lives inside `dir` (blocks path escape).
     pub fn validate_at(&self, dir: &Path) -> Result<(), String> {
         self.validate()?;
         let entry = entry_path(dir, &self.entry)?;
         if !entry.is_file() {
-            return Err(format!("không tìm thấy entry: {}", entry.display()));
+            return Err(format!("entry not found: {}", entry.display()));
         }
         Ok(())
     }
 
-    /// Quyền khai trong manifest (chưa cộng grant của host).
+    /// The permissions declared in the manifest (host grants not added yet).
     pub fn permits(&self, p: Permission) -> bool {
         self.permissions.contains(&p)
     }
@@ -265,12 +267,12 @@ fn valid_id(id: &str) -> bool {
 
 fn entry_path(dir: &Path, entry: &str) -> Result<PathBuf, String> {
     let p = dir.join(entry);
-    // `entry` đã bị chặn `..`/absolute ở validate, nhưng kiểm lần nữa sau khi join
-    // cho chắc — rẻ, và entry là dữ liệu từ đĩa.
+    // `entry` was already blocked for `..`/absolute in validate, but check again after
+    // the join to be sure — it is cheap, and the entry comes from disk.
     let canon_dir = dir.canonicalize().map_err(|e| format!("{}: {e}", dir.display()))?;
     let canon = p.canonicalize().map_err(|e| format!("{}: {e}", p.display()))?;
     if !canon.starts_with(&canon_dir) {
-        return Err(format!("entry nằm ngoài thư mục plugin: {}", canon.display()));
+        return Err(format!("entry is outside the plugin directory: {}", canon.display()));
     }
     Ok(canon)
 }
@@ -289,12 +291,12 @@ pub struct LoadedPlugin {
     pub dir: PathBuf,
     pub manifest: Manifest,
     pub state: State,
-    /// Quyền host cấp thêm ngoài manifest (trạng thái phía host, không nằm trong manifest).
+    /// Extra permissions granted by the host beyond the manifest (host-side state, not in the manifest).
     pub grants: Vec<Permission>,
 }
 
 impl LoadedPlugin {
-    /// Manifest + grant của host.
+    /// The manifest plus the host grants.
     pub fn permits(&self, p: Permission) -> bool {
         self.manifest.permits(p) || self.grants.contains(&p)
     }
@@ -313,7 +315,7 @@ impl LoadedPlugin {
     }
 }
 
-/// Trạng thái phía host lưu cạnh plugin, để grant/enable không mất khi daemon restart.
+/// Host-side state stored alongside the plugin, so grants/enabled survive a daemon restart.
 #[derive(Serialize, Deserialize)]
 struct HostState {
     #[serde(default = "default_true")]
@@ -351,7 +353,7 @@ fn write_host_state(dir: &Path, st: &HostState) -> Result<(), String> {
 pub struct Registry {
     pub root: PathBuf,
     pub plugins: Vec<LoadedPlugin>,
-    /// Plugin bị bỏ qua khi scan, kèm lý do — để daemon báo lại được thay vì im lặng.
+    /// Plugins skipped during the scan, with the reason — so the daemon can report them instead of staying silent.
     pub skipped: Vec<(String, String)>,
 }
 
@@ -360,7 +362,7 @@ impl Registry {
         Self { root, plugins: Vec::new(), skipped: Vec::new() }
     }
 
-    /// Quét `root/*/plugin.json`. Không hợp lệ thì bỏ qua, không làm hỏng cả registry.
+    /// Scan `root/*/plugin.json`. Invalid ones are skipped without breaking the whole registry.
     pub fn scan(&mut self) {
         self.plugins.clear();
         self.skipped.clear();
@@ -393,7 +395,7 @@ impl Registry {
         self.plugins.iter().collect()
     }
 
-    /// Plugin đang bật và khai báo hook này — đây là danh sách hook dispatcher gọi.
+    /// Plugins that are enabled and declare this hook — this is the list the hook dispatcher calls.
     pub fn by_hook(&self, h: Hook) -> Vec<&LoadedPlugin> {
         self.plugins
             .iter()
@@ -414,15 +416,15 @@ impl Registry {
             .plugins
             .iter_mut()
             .find(|p| p.manifest.id == id)
-            .ok_or_else(|| format!("không có plugin: {id}"))?;
+            .ok_or_else(|| format!("no plugin: {id}"))?;
         p.state = if on { State::Enabled } else { State::Disabled };
         write_host_state(&p.dir, &host_state_of(p))
     }
 
-    /// Xoá plugin khỏi đĩa. Tiến trình con phải do `ProcHost::kill` dọn trước.
+    /// Delete the plugin from disk. Child processes must be cleaned up by `ProcHost::kill` first.
     pub fn uninstall(&mut self, id: &str) -> Result<(), String> {
         let Some(p) = self.plugins.iter().find(|p| p.manifest.id == id) else {
-            return Err(format!("không có plugin: {id}"));
+            return Err(format!("no plugin: {id}"));
         };
         let dir = p.dir.clone();
         std::fs::remove_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -435,7 +437,7 @@ impl Registry {
             .plugins
             .iter_mut()
             .find(|p| p.manifest.id == id)
-            .ok_or_else(|| format!("không có plugin: {id}"))?;
+            .ok_or_else(|| format!("no plugin: {id}"))?;
         if !p.grants.contains(&perm) {
             p.grants.push(perm);
         }
@@ -447,7 +449,7 @@ impl Registry {
             .plugins
             .iter_mut()
             .find(|p| p.manifest.id == id)
-            .ok_or_else(|| format!("không có plugin: {id}"))?;
+            .ok_or_else(|| format!("no plugin: {id}"))?;
         p.grants.retain(|x| *x != perm);
         write_host_state(&p.dir, &host_state_of(p))
     }
@@ -471,7 +473,7 @@ fn load_plugin(dir: &Path) -> Result<LoadedPlugin, String> {
     })
 }
 
-/// Cài từ một thư mục plugin. Xong là dùng được ngay, không cần restart daemon.
+/// Install from a plugin directory. Usable immediately afterwards, no daemon restart needed.
 pub fn install_from_dir(dir: &Path, root: &Path) -> Result<String, String> {
     let mpath = dir.join(MANIFEST_FILE);
     let raw = std::fs::read_to_string(&mpath).map_err(|e| format!("{}: {e}", mpath.display()))?;
@@ -480,24 +482,25 @@ pub fn install_from_dir(dir: &Path, root: &Path) -> Result<String, String> {
 
     let dest = root.join(&manifest.id);
     if dest.exists() {
-        return Err(format!("{} đã có sẵn — uninstall trước đã", dest.display()));
+        return Err(format!("{} already exists — uninstall it first", dest.display()));
     }
     std::fs::create_dir_all(root).map_err(|e| format!("{}: {e}", root.display()))?;
     copy_dir(dir, &dest)?;
     Ok(manifest.id)
 }
 
-/// KHÔNG giải nén archive tự động — không có crate tar/gzip, và giải nén tự động là chỗ dễ
-/// dính path traversal nhất. Người dùng tự giải nén rồi gọi `install_from_dir`.
+/// Does NOT auto-extract archives — there is no tar/gzip crate, and auto-extraction is
+/// the easiest place to get a path traversal. The user extracts it themselves and then
+/// calls `install_from_dir`.
 pub fn install_from_archive(path: &Path, _root: &Path) -> Result<String, String> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     let hint = match ext {
-        "gz" | "tgz" => format!("tar -xzf {} -C <thư mục tạm>", path.display()),
-        "zip" => format!("unzip -d <thư mục tạm> {}", path.display()),
-        _ => format!("giải nén {} rồi gọi install_from_dir", path.display()),
+        "gz" | "tgz" => format!("tar -xzf {} -C <temp dir>", path.display()),
+        "zip" => format!("unzip -d <temp dir> {}", path.display()),
+        _ => format!("extract {} then call install_from_dir", path.display()),
     };
     Err(format!(
-        "không giải nén archive trong tiến trình Rust (không có crate tar/gzip, và tự giải nén là chỗ dễ dính path traversal nhất). Làm thủ công: {hint}"
+        "this Rust process does not extract archives (there is no tar/gzip crate, and auto-extraction is the easiest place to get a path traversal). Do it manually: {hint}"
     ))
 }
 
@@ -511,7 +514,7 @@ fn copy_dir(from: &Path, to: &Path) -> Result<(), String> {
         if ft.is_dir() {
             copy_dir(&src, &dst)?;
         } else if ft.is_file() {
-            // Không giữ symlink: symlink là đường trốn ra ngoài thư mục plugin.
+            // Do not preserve symlinks: a symlink is a way out of the plugin directory.
             std::fs::copy(&src, &dst).map_err(|e| format!("{} -> {}: {e}", src.display(), dst.display()))?;
         }
     }
@@ -519,10 +522,10 @@ fn copy_dir(from: &Path, to: &Path) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
-// PluginCtx — ép quyền tại chỗ gọi
+// PluginCtx — permission enforcement at the call site
 // ---------------------------------------------------------------------------
 
-/// Tool do plugin đăng ký.
+/// A tool registered by a plugin.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tool {
     pub name: String,
@@ -533,15 +536,15 @@ type DomQueryFn = Box<dyn FnMut(&str) -> Result<Vec<usize>, String>>;
 type DomTextFn = Box<dyn FnMut(usize) -> String>;
 type DomWriteFn = Box<dyn FnMut(usize, &str) -> bool>;
 
-/// Bộ ngữ cảnh truyền cho host JS. Mọi hàm đều tự kiểm tra quyền và ghi lại
-/// `violations` khi bị từ chối — không có đường nào bypass được.
+/// The context bundle passed to the host JS. Every function checks permissions itself
+/// and records `violations` when denied — there is no bypass.
 pub struct PluginCtx {
     pub plugin_id: String,
-    /// Nguồn sự thật về quyền: manifest + grant của host.
+    /// The source of truth for permissions: the manifest + host grants.
     pub allows: Rc<dyn Fn(Permission) -> bool>,
     pub logs: Vec<String>,
     pub violations: Vec<String>,
-    /// URL đã bị chặn qua `emit_request_block`.
+    /// URLs blocked via `emit_request_block`.
     pub blocked: Vec<String>,
     pub tools: Vec<Tool>,
     pub query: Option<DomQueryFn>,
@@ -551,7 +554,7 @@ pub struct PluginCtx {
 }
 
 impl PluginCtx {
-    /// Ctx không có quyền nào — mặc định đóng.
+    /// A ctx with no permissions — closed by default.
     pub fn new(plugin_id: &str) -> Self {
         Self {
             plugin_id: plugin_id.to_string(),
@@ -567,7 +570,7 @@ impl PluginCtx {
         }
     }
 
-    /// Ctx theo đúng quyền của plugin đã nạp.
+    /// A ctx matching the permissions of the loaded plugin.
     pub fn for_plugin(p: &LoadedPlugin) -> Self {
         let m = p.manifest.permissions.clone();
         let g = p.grants.clone();
@@ -577,7 +580,7 @@ impl PluginCtx {
         }
     }
 
-    /// Nối DOM thật vào ctx (caller sở hữu `Dom`, mượn qua closure).
+    /// Wire the real DOM into the ctx (the caller owns `Dom`, borrowed via closures).
     pub fn with_dom(
         mut self,
         query: DomQueryFn,
@@ -596,59 +599,59 @@ impl PluginCtx {
         (self.allows)(p)
     }
 
-    /// `true` nếu được phép; nếu không thì ghi violation và trả `false`.
+    /// `true` if allowed; otherwise records a violation and returns `false`.
     pub fn require(&mut self, p: Permission, what: &str) -> bool {
         if (self.allows)(p) {
             return true;
         }
         self.violations
-            .push(format!("{}: cần quyền {} cho {}", self.plugin_id, p.as_str(), what));
+            .push(format!("{}: needs the {} permission for {}", self.plugin_id, p.as_str(), what));
         false
     }
 
     pub fn dom_query(&mut self, sel: &str) -> Result<Vec<usize>, String> {
         if !self.require(Permission::DomRead, "dom.query") {
-            return Err(format!("không có quyền {}", Permission::DomRead.as_str()));
+            return Err(format!("missing the {} permission", Permission::DomRead.as_str()));
         }
         match self.query.as_mut() {
             Some(f) => f(sel),
-            None => Err("host không cấp DOM cho plugin".into()),
+            None => Err("the host did not grant a DOM to the plugin".into()),
         }
     }
 
     pub fn dom_text(&mut self, id: usize) -> Result<String, String> {
         if !self.require(Permission::DomRead, "dom.text") {
-            return Err(format!("không có quyền {}", Permission::DomRead.as_str()));
+            return Err(format!("missing the {} permission", Permission::DomRead.as_str()));
         }
         self.text
             .as_mut()
             .map(|f| f(id))
-            .ok_or_else(|| "host không cấp DOM cho plugin".to_string())
+            .ok_or_else(|| "the host did not grant a DOM to the plugin".to_string())
     }
 
     pub fn dom_html(&mut self, id: usize) -> Result<String, String> {
         if !self.require(Permission::DomRead, "dom.html") {
-            return Err(format!("không có quyền {}", Permission::DomRead.as_str()));
+            return Err(format!("missing the {} permission", Permission::DomRead.as_str()));
         }
         self.html
             .as_mut()
             .map(|f| f(id))
-            .ok_or_else(|| "host không cấp DOM cho plugin".to_string())
+            .ok_or_else(|| "the host did not grant a DOM to the plugin".to_string())
     }
 
     pub fn dom_write(&mut self, id: usize, text: &str) -> Result<(), String> {
         if !self.require(Permission::DomWrite, "dom.write") {
-            return Err(format!("không có quyền {}", Permission::DomWrite.as_str()));
+            return Err(format!("missing the {} permission", Permission::DomWrite.as_str()));
         }
         match self.write.as_mut() {
             Some(f) => {
                 if f(id, text) {
                     Ok(())
                 } else {
-                    Err(format!("node không tồn tại: {id}"))
+                    Err(format!("node does not exist: {id}"))
                 }
             }
-            None => Err("host không cấp DOM cho plugin".into()),
+            None => Err("the host did not grant a DOM to the plugin".into()),
         }
     }
 
@@ -658,7 +661,7 @@ impl PluginCtx {
         }
     }
 
-    /// Chặn một URL. Không có `net.intercept` thì trả `false` + ghi violation.
+    /// Block a URL. Without `net.intercept` it returns `false` and records a violation.
     pub fn emit_request_block(&mut self, url: &str) -> bool {
         if !self.require(Permission::NetIntercept, "request.block") {
             return false;
@@ -671,19 +674,19 @@ impl PluginCtx {
 
     pub fn register_tool(&mut self, name: &str, schema: &serde_json::Value) -> Result<(), String> {
         if !self.require(Permission::ToolRegister, "tool.register") {
-            return Err(format!("không có quyền {}", Permission::ToolRegister.as_str()));
+            return Err(format!("missing the {} permission", Permission::ToolRegister.as_str()));
         }
         if name.is_empty() || name.len() > 64 || name.chars().any(|c| c.is_whitespace()) {
-            return Err(format!("tên tool không hợp lệ: {name:?}"));
+            return Err(format!("invalid tool name: {name:?}"));
         }
         if self.tools.iter().any(|t| t.name == name) {
-            return Err(format!("tool đã đăng ký: {name}"));
+            return Err(format!("tool already registered: {name}"));
         }
         self.tools.push(Tool { name: name.to_string(), schema: schema.clone() });
         Ok(())
     }
 
-    /// Có vi phạm nào không — caller nên giảm quyền hoặc báo lại.
+    /// Whether any violations happened — the caller should drop permissions or report back.
     pub fn violated(&self) -> bool {
         !self.violations.is_empty()
     }
@@ -693,11 +696,12 @@ impl PluginCtx {
 // Host JS
 // ---------------------------------------------------------------------------
 
-/// Chạy entry của plugin `kind: js` trong realm đã có, trả về
+/// Run the entry of a `kind: js` plugin inside the existing realm, returning
 /// `{ id, api, hooks, exports, errors }`.
 ///
-/// Realm phải do caller đưa vào: QuickJS realm gắn với `Rc<RefCell<Dom>>` của session,
-/// tạo riêng ở đây sẽ sinh ra DOM thứ hai — đúng loại bug hai nguồn sự thật.
+/// The realm must be supplied by the caller: a QuickJS realm is tied to the session's
+/// `Rc<RefCell<Dom>>`, and creating a separate one here would produce a second DOM —
+/// exactly the two-sources-of-truth bug.
 pub fn run_js_plugin(
     p: &LoadedPlugin,
     realm: &Realm,
@@ -705,18 +709,18 @@ pub fn run_js_plugin(
 ) -> Result<serde_json::Value, String> {
     match p.manifest.kind {
         PluginKind::Js => {}
-        PluginKind::Proc => return Err("plugin proc: dùng ProcHost::call".into()),
+        PluginKind::Proc => return Err("proc plugin: use ProcHost::call".into()),
         PluginKind::Wasm => {
-            return Err("plugin wasm: chưa có runtime wasm trong build này".into());
+            return Err("wasm plugin: there is no wasm runtime in this build".into());
         }
     }
     if !p.enabled() {
-        return Err(format!("plugin {} đang tắt", p.manifest.id));
+        return Err(format!("plugin {} is disabled", p.manifest.id));
     }
     let src = p.read_entry()?;
     let api = p.manifest.api;
 
-    // Cài bridge `__plugin` (đã kiểm quyền) rồi mới chạy lớp vỏ và entry.
+    // Install the `__plugin` bridge (permission-checked) before running the shell and entry.
     let shared = Rc::new(RefCell::new(std::mem::replace(ctx, PluginCtx::new(&p.manifest.id))));
     install_bridge(realm, shared.clone(), &p.manifest.id, api)?;
     eval(realm, PLUGIN_API_JS, "plugin-api")?;
@@ -729,9 +733,9 @@ pub fn run_js_plugin(
                  exports: plugin.exports === undefined ? null : plugin.exports };";
     let mut out = realm
         .eval_json(epilogue)
-        .map_err(|e| format!("plugin {}: đọc exports lỗi: {e}", p.manifest.id))?;
+        .map_err(|e| format!("plugin {}: reading exports failed: {e}", p.manifest.id))?;
 
-    // Mang ctx (log, violation, tool) về lại cho caller.
+    // Hand the ctx (log, violation, tool) back to the caller.
     let back = std::mem::replace(&mut *shared.borrow_mut(), PluginCtx::new(&p.manifest.id));
     *ctx = back;
 
@@ -758,7 +762,7 @@ fn eval(realm: &Realm, src: &str, tag: &str) -> Result<(), String> {
         .with(|c| c.eval::<rquickjs::Value, _>(src).map(|_| ()).map_err(|e| format!("{tag}: {e}")))
 }
 
-/// Cài global `__plugin` — mọi lời gọi từ plugin đều đi qua đây để ép quyền.
+/// Install the `__plugin` global — every call from a plugin goes through here to enforce permissions.
 fn install_bridge(
     realm: &Realm,
     ctx: Rc<RefCell<PluginCtx>>,
@@ -865,16 +869,16 @@ fn install_bridge(
             c.globals().set("__plugin", o)?;
             Ok(())
         })
-        .map_err(|e| format!("cài bridge plugin: {e}"))
+        .map_err(|e| format!("cannot install the plugin bridge: {e}"))
 }
 
 // ---------------------------------------------------------------------------
 // Host proc
 // ---------------------------------------------------------------------------
 
-/// Timeout mặc định cho một lời gọi hook.
+/// The default timeout for one hook call.
 pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(5);
-/// Một dòng JSON dài hơn giới hạn này thì giết tiến trình (chống tràn bộ nhớ).
+/// A JSON line longer than this limit kills the process (prevents memory blowup).
 pub const MAX_LINE: usize = 1024 * 1024;
 
 pub struct ProcHandle {
@@ -883,7 +887,7 @@ pub struct ProcHandle {
     stdin: std::process::ChildStdin,
     lines: Receiver<String>,
     next_id: u64,
-    /// Dòng đã đọc nhưng chưa khớp id (plugin gửi sẵn / log ra stdout).
+    /// Lines already read whose id does not match (the plugin sent them early / logged to stdout).
     spare: Vec<String>,
     pub tools: Vec<serde_json::Value>,
     pub hooks: Vec<String>,
@@ -892,7 +896,7 @@ pub struct ProcHandle {
 
 impl Drop for ProcHandle {
     fn drop(&mut self) {
-        // Luôn giết kèm theo: không để lại zombie hay tiến trình mồ côi.
+        // Always kill along with it: never leave a zombie or an orphan process.
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -923,13 +927,13 @@ impl ProcHost {
         self.procs.is_empty()
     }
 
-    /// Chạy entry của plugin. `proc` = subprocess, không bao giờ `sh -c`.
+    /// Run the entry of a plugin. `proc` = subprocess, never `sh -c`.
     pub fn spawn(&mut self, p: &LoadedPlugin, args: &[String]) -> Result<&mut ProcHandle, String> {
         if p.manifest.kind != PluginKind::Proc {
-            return Err(format!("{} không phải plugin proc", p.manifest.id));
+            return Err(format!("{} is not a proc plugin", p.manifest.id));
         }
         if !p.enabled() {
-            return Err(format!("plugin {} đang tắt", p.manifest.id));
+            return Err(format!("plugin {} is disabled", p.manifest.id));
         }
         let entry = p.entry_path()?;
         let mut cmd = entry_cmd(&entry)?;
@@ -939,8 +943,8 @@ impl ProcHost {
             .stderr(Stdio::null());
 
         let mut child = cmd.spawn().map_err(|e| format!("spawn {}: {e}", entry.display()))?;
-        let stdin = child.stdin.take().ok_or("không có stdin".to_string())?;
-        let out = child.stdout.take().ok_or("không có stdout".to_string())?;
+        let stdin = child.stdin.take().ok_or("no stdin".to_string())?;
+        let out = child.stdout.take().ok_or("no stdout".to_string())?;
         let (tx, rx) = mpsc::channel();
         let max_line = self.max_line;
         std::thread::spawn(move || pump(out, tx, max_line));
@@ -956,7 +960,7 @@ impl ProcHost {
             hooks: Vec::new(),
             killed: false,
         };
-        // Bắt tay là tuỳ chọn: plugin không trả lời thì bỏ qua, không phải là lỗi.
+        // The handshake is optional: if the plugin does not answer, skip it — that is not an error.
         if let Ok(v) = self.call_in(&mut h, "onReady", &serde_json::json!({}), Duration::from_millis(300)) {
             if let Some(obj) = v.as_object() {
                 h.tools = obj
@@ -976,7 +980,7 @@ impl ProcHost {
             }
         }
         self.procs.push(h);
-        self.procs.last_mut().ok_or("không tạo được handle".to_string())
+        self.procs.last_mut().ok_or("cannot get the handle".to_string())
     }
 
     pub fn call(
@@ -989,8 +993,8 @@ impl ProcHost {
         self.call_in(h, hook, payload, t)
     }
 
-    /// Gửi `{"hook":..,"payload":..,"id":n}` và chờ `{"id":n,"result":..}`.
-    /// Timeout / dòng quá dài / JSON rác đều giết tiến trình.
+    /// Send `{"hook":..,"payload":..,"id":n}` and wait for `{"id":n,"result":..}`.
+    /// A timeout / an over-long line / garbage JSON all kill the process.
     pub fn call_in(
         &mut self,
         h: &mut ProcHandle,
@@ -999,7 +1003,7 @@ impl ProcHost {
         timeout: Duration,
     ) -> Result<serde_json::Value, String> {
         if h.killed {
-            return Err(format!("plugin {} đã bị dừng", h.id));
+            return Err(format!("plugin {} was stopped", h.id));
         }
         h.next_id += 1;
         let id = h.next_id;
@@ -1009,7 +1013,7 @@ impl ProcHost {
         if let Err(e) = h.stdin.write_all(line.as_bytes()).and_then(|_| h.stdin.flush()) {
             h.killed = true;
             let _ = h.child.kill();
-            return Err(format!("plugin {} không nhận nữa: {e}", h.id));
+            return Err(format!("plugin {} no longer accepts input: {e}", h.id));
         }
 
         let deadline = Instant::now() + timeout;
@@ -1018,31 +1022,31 @@ impl ProcHost {
             if left.is_zero() {
                 h.killed = true;
                 let _ = h.child.kill();
-                return Err(format!("plugin {} timeout sau {:?}", h.id, timeout));
+                return Err(format!("plugin {} timed out after {:?}", h.id, timeout));
             }
             let got = match h.lines.recv_timeout(left) {
                 Ok(l) => l,
                 Err(RecvTimeoutError::Timeout) => {
                     h.killed = true;
                     let _ = h.child.kill();
-                    return Err(format!("plugin {} timeout sau {:?}", h.id, timeout));
+                    return Err(format!("plugin {} timed out after {:?}", h.id, timeout));
                 }
                 Err(RecvTimeoutError::Disconnected) => {
                     h.killed = true;
-                    return Err(format!("plugin {} đã thoát", h.id));
+                    return Err(format!("plugin {} has exited", h.id));
                 }
             };
             if got.len() > self.max_line {
                 h.killed = true;
                 let _ = h.child.kill();
-                return Err(format!("plugin {} ghi dòng > {} byte", h.id, self.max_line));
+                return Err(format!("plugin {} wrote a line > {} bytes", h.id, self.max_line));
             }
             let v: serde_json::Value = match serde_json::from_str(&got) {
                 Ok(v) => v,
                 Err(e) => {
                     h.killed = true;
                     let _ = h.child.kill();
-                    return Err(format!("plugin {} in JSON rác: {e}", h.id));
+                    return Err(format!("plugin {} printed garbage JSON: {e}", h.id));
                 }
             };
             if v.get("id").and_then(|i| i.as_u64()) != Some(id) {
@@ -1050,13 +1054,13 @@ impl ProcHost {
                 continue;
             }
             if let Some(e) = v.get("error") {
-                return Err(format!("plugin {} lỗi: {e}", h.id));
+                return Err(format!("plugin {} error: {e}", h.id));
             }
             return Ok(v.get("result").cloned().unwrap_or(serde_json::Value::Null));
         }
     }
 
-    /// Giết tiến trình của một plugin (gọi khi uninstall/disable).
+    /// Kill one plugin's process (called on uninstall/disable).
     pub fn kill(&mut self, id: &str) -> bool {
         let before = self.procs.len();
         for h in self.procs.iter_mut() {
@@ -1069,7 +1073,7 @@ impl ProcHost {
         self.procs.len() != before
     }
 
-    /// Giết tất cả — `Drop` của host cũng gọi, nên daemon chết là mọi plugin chết theo.
+    /// Kill everything — the host `Drop` calls it too, so when the daemon dies every plugin dies with it.
     pub fn kill_all(&mut self) {
         for h in self.procs.iter_mut() {
             h.killed = true;
@@ -1084,7 +1088,7 @@ impl Drop for ProcHost {
     }
 }
 
-/// Đọc stdout thành dòng, chặn theo `cap`. Vượt cap thì báo lỗi và dừng bơm.
+/// Read stdout into lines, capped by `cap`. Going over the cap reports an error and stops pumping.
 fn pump(mut out: ChildStdout, tx: mpsc::Sender<String>, cap: usize) {
     let mut buf: Vec<u8> = Vec::with_capacity(8192);
     let mut chunk = [0u8; 8192];
@@ -1112,8 +1116,8 @@ fn pump(mut out: ChildStdout, tx: mpsc::Sender<String>, cap: usize) {
     }
 }
 
-/// Lệnh chạy entry: `.py` → python3, `.js` → node, `.sh` → sh, còn lại là binary
-/// thật (argv[0] trực tiếp). Không có `sh -c` ở bất kỳ đâu.
+/// The command that runs the entry: `.py` → python3, `.js` → node, `.sh` → sh, anything
+/// else is the real binary (argv[0] directly). There is no `sh -c` anywhere.
 fn entry_cmd(entry: &Path) -> Result<Command, String> {
     let mut c = match entry.extension().and_then(|e| e.to_str()).unwrap_or("") {
         "py" => {
@@ -1141,19 +1145,19 @@ fn entry_cmd(entry: &Path) -> Result<Command, String> {
 }
 
 // ---------------------------------------------------------------------------
-// Khám phá interpreter
+// Interpreter discovery
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy)]
 pub struct PluginType {
-    /// Đuôi file entry.
+    /// The entry file extension.
     pub ext: &'static str,
-    /// Interpreter tương ứng.
+    /// The matching interpreter.
     pub interp: &'static str,
     pub available: bool,
 }
 
-/// Interpreter có thật trên máy này không (quét PATH, không chạy gì).
+/// Whether the interpreter really exists on this machine (scans PATH, runs nothing).
 pub fn plugin_types() -> Vec<PluginType> {
     [("py", "python3"), ("js", "node"), ("sh", "sh")]
         .iter()
@@ -1224,11 +1228,11 @@ mod tests {
         let src = tmpdir("src");
         std::fs::write(src.join("main.js"), "// noop").unwrap();
 
-        assert!(load_plugin(&src).is_err(), "entry thiếu thì phải fail");
+        assert!(load_plugin(&src).is_err(), "a missing entry must fail");
         std::fs::write(src.join("main.txt"), "x").unwrap();
         let id = install_from_dir(&src, &root).unwrap();
         assert_eq!(id, "acme.x");
-        assert!(install_from_dir(&src, &root).is_err(), "cài hai lần phải fail");
+        assert!(install_from_dir(&src, &root).is_err(), "installing twice must fail");
 
         let mut reg = Registry::new(root.clone());
         reg.scan();
@@ -1243,7 +1247,7 @@ mod tests {
         reg.grant("acme.x", Permission::NetIntercept).unwrap();
         assert!(reg.get("acme.x").unwrap().permits(Permission::NetIntercept));
 
-        // grant phải sống sót qua lần scan sau (không mất khi daemon restart).
+        // The grant must survive the next scan (not lost on a daemon restart).
         reg.scan();
         assert!(reg.get("acme.x").unwrap().permits(Permission::NetIntercept));
         reg.disable("acme.x").unwrap();
@@ -1273,13 +1277,13 @@ mod tests {
         assert!(ctx.dom_text(1).is_ok());
         assert!(ctx.violations.is_empty());
 
-        assert!(ctx.dom_write(1, "x").is_err(), "chưa grant dom.write");
+        assert!(ctx.dom_write(1, "x").is_err(), "dom.write was not granted");
         assert!(!ctx.emit_request_block("http://ads/"));
         assert!(ctx.register_tool("t", &serde_json::json!({})).is_err());
         assert_eq!(ctx.violations.len(), 3);
         assert!(ctx.violated());
 
-        // grant thêm thì đi qua.
+        // With extra grants it goes through.
         let mut p2 = p;
         p2.grants.push(Permission::NetIntercept);
         p2.grants.push(Permission::ToolRegister);
@@ -1296,21 +1300,21 @@ mod tests {
         assert_eq!(c.get_args().count(), 1);
         let c = entry_cmd(Path::new("bin/tool")).unwrap();
         assert_eq!(c.get_program().to_string_lossy(), "bin/tool");
-        assert_eq!(c.get_args().count(), 0, "không có shell, argv chỉ có entry");
+        assert_eq!(c.get_args().count(), 0, "no shell, argv holds only the entry");
     }
 
     #[test]
     fn plugin_types_reports_real_interpreters() {
         let t = plugin_types();
         assert_eq!(t.len(), 3);
-        assert!(t.iter().any(|x| x.ext == "py" && x.available), "máy này có python3");
-        assert!(t.iter().any(|x| x.ext == "js" && x.available), "máy này có node");
+        assert!(t.iter().any(|x| x.ext == "py" && x.available), "this machine has python3");
+        assert!(t.iter().any(|x| x.ext == "js" && x.available), "this machine has node");
     }
 }
 
-/// Thư mục plugin mặc định: `~/.f1stmux/plugins`.
+/// The default plugin directory: `~/.f1stmux/plugins`.
 ///
-/// Dùng biến môi trường `F1STMUX_HOME` để test được mà không đụng home thật.
+/// Uses the `F1STMUX_HOME` environment variable so it is testable without touching the real home.
 pub fn default_root() -> PathBuf {
     let base = std::env::var("F1STMUX_HOME")
         .map(PathBuf::from)

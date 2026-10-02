@@ -1,38 +1,39 @@
-//! Net — TLS, proxy, và chống rò DNS.
+//! Net — TLS, proxy, and DNS leak prevention.
 //!
-//! Hai quyết định đáng ghi lại ở đây:
-//! 1. Không dùng kho CA của hệ điều hành. Verifier mặc định của rustls cần JNI và
-//!    PANIC trên Android ("Expect rustls-platform-verifier to be initialized"), và
-//!    đọc kho CA hệ thống cũng là một dấu vết riêng tư. Root đi kèm trong binary
-//!    (webpki-roots) là nguồn tin duy nhất được tin cậy.
-//! 2. Mọi tên miền đều phải đi qua DoH. Xem `install_dns_guard` để biết chỗ nào
-//!    vẫn còn ngoại lệ (chính nó cũng nói thẳng phần nào *không* được bảo đảm).
+//! Two decisions worth recording here:
+//! 1. No OS CA store. The default rustls verifier needs JNI and PANICs on
+//!    Android ("Expect rustls-platform-verifier to be initialized"), and reading
+//!    the system CA store is itself a privacy tell. The roots bundled in the binary
+//!    (webpki-roots) are the only trusted source.
+//! 2. Every domain must go through DoH. See `install_dns_guard` for the remaining
+//!    exceptions (it states plainly which parts are *not* guaranteed).
 //!
-//! Không telemetry, không log ra đĩa, không gọi ra ngoài ngoài các URL được yêu cầu.
+//! No telemetry, no logging to disk, no calls out beyond the requested URLs.
 
 use crate::config::Config;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Timeout cho tay cầm (connect + TLS + response headers).
+/// Timeout for the handshake (connect + TLS + response headers).
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-/// Timeout tổng cho một lần tải.
+/// Total timeout for one fetch.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-/// Số hop redirect tối đa. Cao hơn mặc định 10 của reqwest vì vài site dính chuỗi
-/// ngắn; trên đã vượt thì báo lỗi chứ không âm thầm dừng.
+/// Max redirect hops. Higher than reqwest's default 10 because some sites use short
+/// chains; once exceeded, report an error instead of silently stopping.
 pub const MAX_REDIRECTS: usize = 20;
 
-/// Cài CryptoProvider một lần, gọi trước mọi thứ TLS.
-/// Idempotent: gọi nhiều lần cũng an toàn (lỗi AlreadyExists bị bỏ qua).
-/// `main` gọi hàm này đầu tiên; `tls_config()` cũng tự cài để không phụ thuộc thứ tự gọi.
+/// Install the CryptoProvider once, called before anything TLS.
+/// Idempotent: calling it many times is safe (the AlreadyExists error is ignored).
+/// `main` calls this first; `tls_config()` also installs it so the call order does not matter.
 pub fn init_tls() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
-/// ClientConfig dùng chung cho client chính và client DoH nội bộ.
+/// ClientConfig shared by the main client and the internal DoH client.
 pub fn tls_config() -> rustls::ClientConfig {
-    // Provider phải cài TRƯỚC mọi ClientConfig, nếu không rustls panic khi tự tìm.
+    // The provider must be installed BEFORE any ClientConfig, otherwise rustls panics
+    // while looking one up itself.
     init_tls();
     let roots: rustls::RootCertStore = webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect();
     rustls::ClientConfig::builder()
@@ -40,16 +41,17 @@ pub fn tls_config() -> rustls::ClientConfig {
         .with_no_client_auth()
 }
 
-/// Client HTTP dùng chung cho mọi request: TLS roots bundle sẵn, redirect tay
-/// (để mỗi hop gắn lại header theo profile), proxy theo config, và DoH guard.
+/// The HTTP client shared by every request: pre-bundled TLS roots, manual
+/// redirects (so each hop reattaches the profile headers), proxy from the config,
+/// and the DoH guard.
 ///
-/// Caller nên cache kết quả: dựng client tốn công copy 121 trust anchor. Không có
-/// state nào được ghi ra đĩa ở đây.
+/// Callers should cache the result: building a client costs a copy of 121 trust
+/// anchors. No state is written to disk here.
 pub fn client(cfg: &Config) -> Result<reqwest::Client, String> {
     let ua = crate::stealth::profile(&cfg.profile)
         .map(|p| p.ua)
-        // Chỉ là fallback: `get`/`post_form` luôn gắn UA của profile. UA mặc định
-        // của reqwest ("reqwest/0.13") sẽ tự tố giả trình duyệt.
+        // Only a fallback: `get`/`post_form` always attach the profile UA. reqwest's
+        // default UA ("reqwest/0.13") would self-report as a bot.
         .unwrap_or("Mozilla/5.0");
     let mut b = reqwest::Client::builder()
         .user_agent(ua)
@@ -59,31 +61,31 @@ pub fn client(cfg: &Config) -> Result<reqwest::Client, String> {
         .pool_idle_timeout(Duration::from_secs(30));
 
     if let Some(p) = cfg.proxy.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
-        let proxy = reqwest::Proxy::all(p).map_err(|e| format!("proxy không hợp lệ ({p}): {e}"))?;
+        let proxy = reqwest::Proxy::all(p).map_err(|e| format!("invalid proxy ({p}): {e}"))?;
         b = b.proxy(proxy);
     }
     b = b.use_preconfigured_tls(tls_config());
     install_dns_guard(&mut b, cfg)?;
-    b.build().map_err(|e| format!("không dựng được HTTP client: {e}"))
+    b.build().map_err(|e| format!("cannot build the HTTP client: {e}"))
 }
 
-/// Cắm DNS-over-HTTPS vào builder: mọi tên miền của mọi request đều được phân
-/// giải qua DoH thay vì `getaddrinfo` của hệ điều hành.
+/// Plug DNS-over-HTTPS into the builder: the domain of every request is resolved
+/// via DoH instead of the OS `getaddrinfo`.
 ///
-/// Mức bảo đảm thực tế, nói thẳng:
-/// - ĐƯỢC bảo đảm: không còn request nào tới tên miền nào đi qua resolver hệ
-///   thống. reqwest gọi đúng resolver này cho mọi kết nối HTTP(S) trực tiếp.
-/// - KHÔNG được bảo đảm: (a) tên miền của chính endpoint DoH được hệ thống phân
-///   giải một lần lúc bootstrap — đây là điều không tránh được với endpoint ghi
-///   bằng tên miền; muốn sạch tuyệt đối thì đặt `cfg.doh` là IP literal hoặc tên
-///   sau một proxy. (b) Khi `cfg.proxy` là proxy HTTP/SOCKS, chính proxy sẽ phân
-///   giải tên đích — máy này không phân giải nữa, nhưng ISP của bạn không thấy tên
-///   đó, và người vận hành proxy thì có. (c) Nếu DoH hỏng, `lookup` trả lỗi và
-///   request chết — cố ý không fallback về resolver hệ thống, vì fallback đó chính
-///   là rò DNS.
+/// The real level of guarantee, stated plainly:
+/// - GUARANTEED: no request to any domain goes through the system resolver any
+///   more. reqwest calls exactly this resolver for every direct HTTP(S) connection.
+/// - NOT guaranteed: (a) the domain of the DoH endpoint itself is resolved by the
+///   system once at bootstrap — unavoidable for a domain-named endpoint; for an
+///   absolutely clean setup set `cfg.doh` to an IP literal or a name behind a
+///   proxy. (b) When `cfg.proxy` is an HTTP/SOCKS proxy, the proxy resolves the
+///   target name — this machine no longer resolves it, but your ISP does not see
+///   the name while the proxy operator does. (c) If DoH breaks, `lookup` returns an
+///   error and the request dies — deliberately no fallback to the system resolver,
+///   because that fallback is exactly the DNS leak.
 ///
-/// Có dùng `redirect`, `SNI` hay IP pinning không? Không — nếu muốn chống DNS
-/// rebinding thật sự thì phải validate IP sau khi phân giải, chuyện của session.
+/// Does it use `redirect`, `SNI`, or IP pinning? No — to genuinely stop DNS
+/// rebinding you must validate the IP after resolving, which is session territory.
 pub fn install_dns_guard(b: &mut reqwest::ClientBuilder, cfg: &Config) -> Result<(), String> {
     let doh = Doh::new(&cfg.doh)?;
     let taken = std::mem::take(b);
@@ -91,11 +93,11 @@ pub fn install_dns_guard(b: &mut reqwest::ClientBuilder, cfg: &Config) -> Result
     Ok(())
 }
 
-/// TTL cache cố định. Đọc TTL từ DoH là tối ưu, không phải điều kiện bảo mật —
-/// nếu cache sai thì tối đa là hơi cũ, không rò gì thêm.
+/// Fixed cache TTL. Reading the TTL from DoH is an optimisation, not a security
+/// condition — a wrong cache is at worst slightly stale and leaks nothing extra.
 const DNS_CACHE_TTL: Duration = Duration::from_secs(60);
 
-/// Resolver DoH: JSON API (`?name=..&type=A`), cache trong RAM theo tên.
+/// DoH resolver: JSON API (`?name=..&type=A`), cached in RAM by name.
 #[derive(Clone)]
 struct Doh {
     endpoint: String,
@@ -107,32 +109,33 @@ impl Doh {
     fn new(endpoint: &str) -> Result<Self, String> {
         let endpoint = endpoint.trim();
         if endpoint.is_empty() {
-            return Err("cfg.doh rỗng: không có DoH thì không chống rò DNS được".into());
+            return Err("cfg.doh is empty: without DoH there is no DNS leak protection".into());
         }
         let u = reqwest::Url::parse(endpoint)
-            .map_err(|e| format!("URL DoH không hợp lệ ({endpoint}): {e}"))?;
+            .map_err(|e| format!("invalid DoH URL ({endpoint}): {e}"))?;
         if u.scheme() != "https" {
             return Err(format!(
-                "DoH phải là https, không phải {}:// ({endpoint}): bản thân truy vấn DNS mà đi plaintext thì vô nghĩa",
+                "DoH must be https, not {}:// ({endpoint}): a DNS query over plaintext is pointless",
                 u.scheme()
             ));
         }
-        // Client nội bộ: dùng resolver hệ thống, KHÔNG dùng chính guard này (thế là
-        // đệ quy vô hạn), không đi qua proxy (nếu đã qua proxy thì DoH là vô nghĩa).
+        // Internal client: uses the system resolver, NOT this guard itself (that
+        // would recurse forever), and does not go through the proxy (if it already
+        // went through a proxy, DoH would be pointless).
         let http = reqwest::Client::builder()
             .user_agent(crate::stealth::profile("chrome").map(|p| p.ua).unwrap_or("Mozilla/5.0"))
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(10))
             .use_preconfigured_tls(tls_config())
             .build()
-            .map_err(|e| format!("không dựng được client DoH nội bộ: {e}"))?;
+            .map_err(|e| format!("cannot build the internal DoH client: {e}"))?;
         Ok(Self { endpoint: endpoint.to_string(), http, cache: Arc::new(Mutex::new(Vec::new())) })
     }
 
     async fn lookup(&self, host: &str) -> Result<Vec<SocketAddr>, String> {
-        // Chặn ký tự lạ: `host` đi thẳng vào query string của DoH.
+        // Reject odd characters: `host` goes straight into the DoH query string.
         if host.is_empty() || !host.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_')) {
-            return Err(format!("tên miền không hợp lệ, không truy vấn DoH: {host}"));
+            return Err(format!("invalid domain, not querying DoH: {host}"));
         }
         if let Ok(c) = self.cache.lock()
             && let Some((_, addrs, at)) = c.iter().find(|(k, _, _)| k == host)
@@ -149,21 +152,21 @@ impl Doh {
             .header("accept", "application/dns-json")
             .send()
             .await
-            .map_err(|e| format!("truy vấn DoH cho {host} thất bại: {e}"))?;
+            .map_err(|e| format!("DoH query for {host} failed: {e}"))?;
         if !r.status().is_success() {
-            return Err(format!("DoH server {} trả về lỗi cho {host}", r.status()));
+            return Err(format!("DoH server {} returned an error for {host}", r.status()));
         }
-        // `.json()` của reqwest cần feature `json`; tự parse để không phải bật
-        // thêm feature cho cả crate chỉ vì một chỗ.
+        // reqwest's `.json()` needs the `json` feature; parse it ourselves so the
+        // whole crate does not enable an extra feature for one place.
         let raw = r
             .bytes()
             .await
-            .map_err(|e| format!("đọc body DoH của {host} lỗi: {e}"))?;
+            .map_err(|e| format!("reading the DoH body for {host} failed: {e}"))?;
         let j: serde_json::Value =
-            serde_json::from_slice(&raw).map_err(|e| format!("body DoH của {host} không phải JSON: {e}"))?;
+            serde_json::from_slice(&raw).map_err(|e| format!("the DoH body for {host} is not JSON: {e}"))?;
 
-        // type 1 = A, 28 = AAAA. Server DoH trả cả chuỗi CNAME trong Answer nên
-        // lọc theo type là đủ, không cần đuổi CNAME.
+        // type 1 = A, 28 = AAAA. A DoH server also returns the CNAME chain in the
+        // Answer section, so filtering by type is enough — no need to chase CNAMEs.
         let mut v4: Vec<SocketAddr> = Vec::new();
         let mut v6: Vec<SocketAddr> = Vec::new();
         for a in j.get("Answer").and_then(|x| x.as_array()).map(|x| x.as_slice()).unwrap_or(&[]) {
@@ -174,16 +177,16 @@ impl Doh {
             else {
                 continue;
             };
-            // Port 0 = reqwest điền port mặc định theo scheme.
+            // Port 0 = reqwest fills in the default port for the scheme.
             match ip {
                 IpAddr::V4(v) => v4.push(SocketAddr::new(IpAddr::V4(v), 0)),
                 IpAddr::V6(v) => v6.push(SocketAddr::new(IpAddr::V6(v), 0)),
             }
         }
-        // Ưu tiên IPv4: mạng di động Android hay có NAT64, đường vòng thì chậm hơn.
+        // Prefer IPv4: Android mobile networks often have NAT64, and the detour is slower.
         let addrs = if v4.is_empty() { v6 } else { v4 };
         if addrs.is_empty() {
-            return Err(format!("DoH không có bản ghi A/AAAA cho {host}"));
+            return Err(format!("DoH has no A/AAAA record for {host}"));
         }
         if let Ok(mut c) = self.cache.lock() {
             c.retain(|(k, _, at)| k != host && at.elapsed() < DNS_CACHE_TTL);
@@ -204,19 +207,19 @@ impl reqwest::dns::Resolve for Doh {
     }
 }
 
-/// Biến lỗi reqwest thành thông điệp nói đúng nguyên nhân, vì "error" trần
-/// không giúp được ai debug trên terminal.
+/// Turn a reqwest error into a message naming the real cause, because a bare
+/// "error" helps nobody debug on a terminal.
 pub fn err_msg(e: &reqwest::Error) -> String {
     if e.is_timeout() {
-        "hết thời gian chờ (timeout)".into()
+        "timed out".into()
     } else if e.is_dns() {
-        format!("DNS/DoH thất bại: {e}")
+        format!("DNS/DoH failure: {e}")
     } else if e.is_connect() {
-        format!("không kết nối được: {e}")
+        format!("cannot connect: {e}")
     } else if e.is_body() || e.is_decode() {
-        format!("lỗi đọc/giải nén body: {e}")
+        format!("body read/decompress error: {e}")
     } else if e.is_redirect() {
-        format!("lỗi redirect: {e}")
+        format!("redirect error: {e}")
     } else {
         e.to_string()
     }

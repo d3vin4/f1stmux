@@ -1,7 +1,22 @@
+[workspace]
+resolver = "3"
+members = ["browser"]
+
+[workspace.package]
+edition = "2024"
+
 [package]
 name = "f1stmux"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
+
+[[bin]]
+name = "f1stmux"
+path = "src/main.rs"
+
+[lib]
+name = "f1stmux"
+path = "src/lib.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -15,8 +30,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 encoding_rs = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
+regex = "1"
 base64 = "0.22"
 rand = "0.8"
+f1stchrome = { path = "browser" }
 
 [profile.release]
 opt-level = "z"

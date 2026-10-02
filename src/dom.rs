@@ -1,8 +1,8 @@
-//! DOM + bridge sang QuickJS.
+//! DOM + bridge into QuickJS.
 //!
-//! Một cây DOM duy nhất, sống trong Rust. QuickJS nhìn nó qua một lớp vỏ JS
-//! (xem `assets/dom.js`). Không có hai nguồn sự thật — nếu có, mọi bug DOM
-//! sẽ là loại bug khó tìm nhất.
+//! A single DOM tree living in Rust. QuickJS sees it through a thin JS shell
+//! (see `assets/dom.js`). There is no second source of truth — if there were, every
+//! DOM bug would be of the hardest-to-find kind.
 
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -12,12 +12,12 @@ use std::rc::Rc;
 pub struct Node {
     pub id: usize,
     pub parent: Option<usize>,
-    /// name, hoặc "#text" cho node văn bản.
+    /// The name, or "#text" for a text node.
     pub name: String,
     pub attrs: Vec<(String, String)>,
     pub text: String,
     pub children: Vec<usize>,
-    /// Node script thuộc DOM gốc — không expose ra JS (an toàn, và nhanh).
+    /// A script node from the original DOM — not exposed to JS (safer, and faster).
     pub raw: bool,
 }
 
@@ -27,7 +27,7 @@ pub enum SelectErr {
     Oob,
 }
 
-/// Cây DOM sở hữu node; đồng thời là nguồn cho querySelector và cho JS.
+/// The DOM tree owning the nodes; it is also the source for querySelector and for JS.
 #[derive(Debug, Default)]
 pub struct Dom {
     pub nodes: Vec<Node>,
@@ -57,7 +57,7 @@ impl Dom {
         self.nodes.get(id)
     }
 
-    /// innerHTML của một node (serialize từ cây, không dùng string gốc).
+    /// The innerHTML of one node (serialised from the tree, not from the raw string).
     pub fn inner_html(&self, id: usize) -> String {
         let Some(n) = self.nodes.get(id) else { return String::new() };
         if n.name == "#text" {
@@ -105,7 +105,8 @@ impl Dom {
     pub fn text_content(&self, id: usize) -> String {
         let mut out = String::new();
         self.collect_text(id, &mut out);
-        // Gộp khoảng trắng: giống trình duyệt, và giúp LLM đọc dễ hơn nhiều.
+        // Collapse whitespace: like a browser, and it makes the output much easier
+        // for an LLM to read.
         out.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
@@ -127,9 +128,9 @@ impl Dom {
         }
     }
 
-    /// Ưu tiên selector đơn giản, đủ cho phần lớn công việc thực tế.
-    /// Hỗ trợ: `tag`, `#id`, `.class`, `tag#id`, `[attr]`, `tag[attr]`, kết hợp.
-    /// Cố tình KHÔNG implement CSS selector engine đầy đủ — thêm khi cần thật.
+    /// Simple selectors first, enough for most real work.
+    /// Supported: `tag`, `#id`, `.class`, `tag#id`, `[attr]`, `tag[attr]`, combinations.
+    /// Deliberately NOT a full CSS selector engine — add one when it is truly needed.
     pub fn query(&self, sel: &str, from: usize) -> Result<Vec<usize>, SelectErr> {
         let sel = sel.trim();
         if sel.is_empty() {
@@ -153,7 +154,7 @@ impl Dom {
         }
         if !buf.is_empty() { parts.push(buf); }
         if parts.is_empty() { return Err(SelectErr::BadSelector); }
-        // Chỉ hỗ trợ một chuỗi đơn giản, hoặc lồng bằng khoảng trắng (descendant).
+        // Only a single simple chain, or nesting by whitespace (descendant).
         let simple: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
         for &p in &simple {
             cur = cur.iter().flat_map(|&i| self.descendants(i)).collect();
@@ -225,9 +226,9 @@ impl Dom {
     }
 }
 
-/// Cắt token selector tại vị trí byte. Mọi vị trí cắt đều nằm ngay trước một
-/// ký tự ASCII (# . [) hoặc cuối chuỗi, nên luôn là biên ký tự UTF-8 hợp lệ —
-/// không cần `unsafe`, slice trực tiếp trên &str đã đủ.
+/// Cut a selector token at a byte position. Every cut lands right before an ASCII
+/// character (# . [) or at the end of the string, so it is always a valid UTF-8 char
+/// boundary — no `unsafe` needed, slicing &str directly is enough.
 fn token(s: &str, mut i: usize) -> (&str, usize) {
     let b = s.as_bytes();
     let start = i;
@@ -237,7 +238,7 @@ fn token(s: &str, mut i: usize) -> (&str, usize) {
     (&s[start..i], i)
 }
 
-/// Escape giá trị attribute khi serialize: không escape là ra HTML vỡ.
+/// Escape an attribute value while serialising: not escaping produces broken HTML.
 fn escape_attr(v: &str) -> String {
     let mut out = String::with_capacity(v.len());
     for c in v.chars() {
@@ -256,5 +257,5 @@ static VOID: &[&str] = &["area","base","br","col","embed","hr","img","input","li
 static SKIP: &[&str] = &["script","style","noscript","template","head","meta","link","title"];
 static BLOCK: &[&str] = &["p","div","section","article","header","footer","li","tr","h1","h2","h3","h4","h5","h6","br","table","ul","ol","main","nav","aside","blockquote","pre"];
 
-/// Bọc DOM trong Rc để chia sẻ giữa Rust và lớp vỏ JS mà không clone.
+/// Wrap the DOM in an Rc so it is shared between Rust and the JS shell without cloning.
 pub type SharedDom = Rc<RefCell<Dom>>;

@@ -1,65 +1,70 @@
-//! F1stmux CLI. Một binary: vừa làm client, vừa làm daemon.
+//! F1stmux CLI. One binary: both a client and a daemon.
 
 use clap::{Parser, Subcommand};
 use f1stmux::config::Config;
 
 #[derive(Parser)]
-#[command(name = "f1stmux", version, about = "Headless browser cho AI, thiết kế Termux")]
+#[command(name = "f1stmux", version, about = "Headless browser for AI, built for Termux")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
-    /// Đường dẫn file config JSON.
+    /// Path to the JSON config file.
     #[arg(long, global = true)]
     config: Option<std::path::PathBuf>,
-    /// Profile giả danh tính: chrome, edge, brave.
+    /// Identity profile: chrome, edge, brave.
     #[arg(long, global = true)]
     profile: Option<String>,
     /// Proxy http/https/socks5.
     #[arg(long, global = true)]
     proxy: Option<String>,
-    /// Cho phép daemon bind địa chỉ remote (mặc định chỉ loopback, vì daemon không auth).
+    /// Allow the daemon to bind a remote address (defaults to loopback only, since the daemon has no auth).
     #[arg(long, global = true)]
     allow_remote: bool,
+    /// Engine: fast | chromium | auto (auto picks chromium when the page needs full layout/API).
+    #[arg(long, global = true, default_value = "fast")]
+    engine: String,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Chạy daemon (JSON-RPC + DevTools).
+    /// Run the daemon (JSON-RPC + DevTools).
     Serve,
-    /// Mở một URL và in ra.
+    /// Open a URL and print it.
     Get {
         url: String,
-        /// In DOM thay vì text.
+        /// Print the DOM instead of text.
         #[arg(long)]
         dom: bool,
-        /// In JSON đầy đủ (NavResult).
+        /// Print the full JSON (NavResult).
         #[arg(long)]
         json: bool,
-        /// Không chạy JS.
+        /// Do not run JS.
         #[arg(long)]
         no_js: bool,
     },
-    /// Chạy JS trên URL và in kết quả.
+    /// Run JS on a URL and print the result.
     Eval {
         url: String,
         script: String,
     },
-    /// In accessibility/DOM snapshot dạng cây.
+    /// Print an accessibility/DOM snapshot as a tree.
     Tree { url: String },
-    /// Liệt kê tool cho AI.
+    /// List the tools available to AI.
     Tools,
-    /// Đo hiệu năng.
+    /// Measure performance.
     Bench {
-        /// Đường dẫn tới danh sách URL (mỗi dòng một URL).
+        /// Path to a URL list (one URL per line).
         #[arg(long)]
         urls: Option<String>,
         #[arg(long)]
         compare: Option<String>,
     },
-    /// DevTools trong terminal: vòng lặp lệnh trên tab hiện tại.
+    /// DevTools in the terminal: a command loop on the current tab.
     Devtools { url: String },
-    /// MCP server qua stdio cho AI client (opencode, Claude Code...).
+    /// MCP server over stdio for AI clients (opencode, Claude Code...).
     Mcp,
+    /// Static security audit of a URL: headers, CSP/CORS, cookies, endpoint/CVE literals in the source.
+    Audit { url: String },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -70,12 +75,50 @@ async fn main() {
     if let Some(p) = cli.proxy { cfg.proxy = Some(p); }
     if cli.allow_remote { cfg.allow_remote = true; }
 
-    // Provider TLS phải cài trước mọi thứ. Xem src/net.rs.
+    // --engine chromium/auto: point discovery via env for the lib, full adapter not embedded yet.
+    // No faking: a missing binary only reports clearly + falls back to the fast engine.
+    let engine = f1stchrome::EngineKind::parse(&cli.engine);
+    if engine != f1stchrome::EngineKind::Fast {
+        if let Err(e) = probe_chromium().await {
+            eprintln!("note: --engine {} requires the chromium backend — {e}. Using the fast engine for this command.", cli.engine);
+        }
+    }
+
+    // The TLS provider must be installed before anything else. See src/net.rs.
     f1stmux::net::init_tls();
 
     if let Err(e) = run(&cfg, cli.cmd).await {
-        eprintln!("lỗi: {e}");
+        eprintln!("error: {e}");
         std::process::exit(1);
+    }
+}
+
+/// Check whether chrome-headless-shell/Chromium exists on the machine. Returns a clear
+/// error instead of faking a browser. Discovery: the F1STCHROME_CDP env var (host:port)
+/// or the chrome-headless-shell binary in PATH.
+async fn probe_chromium() -> Result<(), String> {
+    if std::env::var("F1STCHROME_CDP").is_ok() {
+        return Ok(());
+    }
+    for bin in ["chrome-headless-shell", "chromium", "google-chrome", "chromium-browser"] {
+        if which::which(bin).is_ok() {
+            return Ok(());
+        }
+    }
+    Err("chrome-headless-shell/chromium not found; set F1STCHROME_CDP=host:port to attach".into())
+}
+
+/// Minimal `which` — avoids adding a crate for a single PATH scan.
+mod which {
+    pub fn which(bin: &str) -> std::io::Result<()> {
+        let path = std::env::var("PATH").map_err(|_| std::io::Error::other("no PATH"))?;
+        for dir in path.split(':') {
+            let p = std::path::Path::new(dir).join(bin);
+            if p.is_file() {
+                return Ok(());
+            }
+        }
+        Err(std::io::Error::other("not found"))
     }
 }
 
@@ -92,7 +135,7 @@ async fn run(cfg: &Config, cmd: Cmd) -> Result<(), String> {
                 println!("{}", r.text);
             }
             if !r.errors.is_empty() {
-                eprintln!("\n--- {} lỗi JS ---", r.errors.len());
+                eprintln!("\n--- {} JS errors ---", r.errors.len());
                 for e in r.errors.iter().take(10) {
                     eprintln!("  {e}");
                 }
@@ -116,6 +159,7 @@ async fn run(cfg: &Config, cmd: Cmd) -> Result<(), String> {
         Cmd::Bench { urls, compare } => f1stmux::cli::bench(cfg, urls.as_deref(), compare.as_deref()).await,
         Cmd::Devtools { url } => f1stmux::cli::devtools(cfg, &url).await,
         Cmd::Mcp => f1stmux::mcp::run(cfg.clone()).await,
+        Cmd::Audit { url } => f1stmux::cli::audit(cfg, &url).await,
     }
 }
 

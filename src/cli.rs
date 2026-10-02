@@ -1,9 +1,9 @@
-//! Lớp tiện ích cho CLI: get, eval, bench, devtools.
+//! Utility layer for the CLI: get, eval, bench, devtools.
 //!
-//! Tách khỏi `main.rs` để `main.rs` chỉ lo parse lệnh.
+//! Split out of `main.rs` so `main.rs` only parses commands.
 //!
-//! Tất cả chạy trên runtime current_thread duy nhất của `main` — không tự
-//! tạo runtime con (lồng runtime là panic ngay).
+//! Everything runs on the single `current_thread` runtime owned by `main` — it
+//! never creates a child runtime (a nested runtime panics immediately).
 
 use crate::config::Config;
 use crate::session::{navigate, Session, WaitFor};
@@ -25,11 +25,11 @@ pub fn dom_html(r: &crate::session::NavResult) -> Result<String, String> {
     Ok(r.html.clone())
 }
 
-/// Đo hiệu năng trên cùng một bộ URL, có thể so với Lightpanda.
+/// Measure performance over the same set of URLs, optionally compared to Lightpanda.
 pub async fn bench(cfg: &Config, urls_file: Option<&str>, compare: Option<&str>) -> Result<(), String> {
     let urls: Vec<String> = match urls_file {
         Some(f) => std::fs::read_to_string(f)
-            .map_err(|e| format!("đọc {f}: {e}"))?
+            .map_err(|e| format!("read {f}: {e}"))?
             .lines()
             .map(str::trim)
             .filter(|l| !l.is_empty() && !l.starts_with('#'))
@@ -42,7 +42,7 @@ pub async fn bench(cfg: &Config, urls_file: Option<&str>, compare: Option<&str>)
         ],
     };
     if urls.is_empty() {
-        return Err("không có URL nào để đo".into());
+        return Err("no URLs to measure".into());
     }
 
     println!("profile: {}   URL: {}", cfg.profile, urls.len());
@@ -63,7 +63,7 @@ pub async fn bench(cfg: &Config, urls_file: Option<&str>, compare: Option<&str>)
         }
     }
 
-    // RSS hiện tại của chính tiến trình.
+    // Current RSS of this very process.
     let rss = std::fs::read_to_string("/proc/self/status")
         .ok()
         .and_then(|s| s.lines().find(|l| l.starts_with("VmRSS")).map(str::to_string))
@@ -75,7 +75,7 @@ pub async fn bench(cfg: &Config, urls_file: Option<&str>, compare: Option<&str>)
     }
 
     if let Some(bin) = compare {
-        println!("\n=== so sánh với {bin} ===");
+        println!("\n=== comparison with {bin} ===");
         println!("{:.<52} {:>9}", "URL", "ms");
         for u in &urls {
             let t = Instant::now();
@@ -89,12 +89,12 @@ pub async fn bench(cfg: &Config, urls_file: Option<&str>, compare: Option<&str>)
 
     let total: f64 = ours.iter().map(|(_, ms, _)| ms).sum();
     if !ours.is_empty() {
-        println!("\ntrung bình: {:.0} ms/URL", total / ours.len() as f64);
+        println!("\naverage: {:.0} ms/URL", total / ours.len() as f64);
     }
     Ok(())
 }
 
-/// DevTools trong terminal: vòng lặp REPL trên một tab.
+/// DevTools in the terminal: a REPL loop over one tab.
 pub async fn devtools(cfg: &Config, url: &str) -> Result<(), String> {
     use std::io::Write;
 
@@ -102,14 +102,14 @@ pub async fn devtools(cfg: &Config, url: &str) -> Result<(), String> {
     let nav = navigate(url, cfg, &mut sess, &WaitFor::default(), true).await?;
     println!("loaded {} -> {} ({})", nav.final_url, nav.status, nav.elapsed_ms);
     println!("title: {}", nav.title);
-    println!("text:  {} ký tự", nav.text.len());
+    println!("text:  {} chars", nav.text.len());
     if !nav.console.is_empty() {
-        println!("console: {} dòng", nav.console.len());
+        println!("console: {} lines", nav.console.len());
         for (k, m) in nav.console.iter().take(20) {
             println!("  [{k}] {m}");
         }
     }
-    println!("\ngõ: q thoát · t text · d dom · c console · n network · <expr> eval JS");
+    println!("\nkeys: q quit · t text · d dom · c console · n network · <expr> eval JS");
     let _ = std::io::stdout().flush();
 
     let mut line = String::new();
@@ -140,14 +140,29 @@ pub async fn devtools(cfg: &Config, url: &str) -> Result<(), String> {
             "" => {}
             expr => match crate::session::eval(&sess, expr) {
                 Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default()),
-                Err(e) => println!("lỗi JS: {e}"),
+                Err(e) => println!("JS error: {e}"),
             },
         }
     }
     Ok(())
 }
 
-/// Cài CryptoProvider. Phải gọi trước mọi thứ TLS — xem `net.rs`.
-pub fn init_tls() {
-    let _ = stealth::names();
+pub async fn audit(cfg: &Config, url: &str) -> Result<(), String> {
+    let mut sess = crate::session::Session::new();
+    let r = crate::session::navigate(url, cfg, &mut sess, &crate::session::WaitFor::default(), false).await?;
+    let cookies: Vec<crate::fetch::Cookie> = sess.cookies.all().iter().cloned().collect();
+    let mut a = crate::audit::audit_from(
+        &r.final_url,
+        r.status,
+        &sess.net.last().map(|n| n.resp_headers.clone()).unwrap_or_default(),
+        &sess.dom.as_ref().map(|d| d.borrow().inner_html(0)).unwrap_or_default(),
+        &cookies,
+    );
+    a.url = url.into();
+    println!("{} -> {} ({})\n", a.url, a.final_url, a.status);
+    println!("missing security headers: {}", a.missing_headers.join(", "));
+    for f in &a.findings {
+        println!("[{:4}] {}\n       {}", f.level, f.title, f.evidence);
+    }
+    Ok(())
 }

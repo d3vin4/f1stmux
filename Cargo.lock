@@ -375,15 +375,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "f1stchrome"
+version = "0.3.0"
+dependencies = [
+ "base64 0.22.1",
+ "rand",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "webpki-roots",
+]
+
+[[package]]
 name = "f1stmux"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "clap",
  "encoding_rs",
+ "f1stchrome",
  "html5ever",
  "markup5ever_rcdom",
  "rand",
+ "regex",
  "reqwest",
  "rquickjs",
  "rustls",

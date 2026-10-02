@@ -1,16 +1,16 @@
-//! Human-solve challenge portal — generic, không gắn với bất kỳ site nào.
+//! Human-solve challenge portal — generic, tied to no specific site.
 //!
-//! Khi phát hiện challenge (captcha & co), f1stmux KHÔNG tự giải: challenge
-//! nào cũng verify server-side, token giả không bao giờ qua. Thay vào đó:
-//! tạo ticket → phục vụ portal loopback cho người dùng giải trên browser thật
-//! → nhận token → replay vào session → trả URL đích.
+//! When a challenge (captcha and friends) is detected, f1stmux does NOT solve it
+//! by itself: every challenge verifies server-side, so a fake token never passes.
+//! Instead: create a ticket → serve a loopback portal for the user to solve it in a
+//! real browser → receive the token → replay it into the session → return the target URL.
 //!
-//! Nguyên tắc an toàn:
-//! - solve() KHÔNG BAO GIỜ navigate tới đích — chỉ trả URL để agent xử lý
-//!   (chặn/log/báo). Không có flag nào bật tự mở cả.
-//! - Ticket/token sống trong RAM, hết hạn sau 10 phút, token dùng một lần.
-//! - Portal chỉ phục vụ qua daemon loopback (xem gate trong rpc::serve).
-//! - Không log token ra bất cứ đâu.
+//! Safety rules:
+//! - solve() NEVER navigates to the target — it only returns the URL for the agent
+//!   to handle (block/log/report). No flag turns that auto-open on.
+//! - Tickets/tokens live in RAM, expire after 10 minutes, a token is single-use.
+//! - The portal is only served over the loopback daemon (see the gate in rpc::serve).
+//! - The token is never logged anywhere.
 
 use crate::dom::Dom;
 use serde::{Deserialize, Serialize};
@@ -19,12 +19,12 @@ use std::sync::{Arc, Mutex};
 
 pub const TICKET_TTL_MS: u64 = 600_000;
 
-/// Cách navigate ứng xử khi gặp challenge.
+/// How navigation reacts when it hits a challenge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnChallenge {
-    /// Mặc định: chỉ gắn flag `captcha`, không làm gì thêm.
+    /// Default: only set the `captcha` flag, do nothing else.
     Ignore,
-    /// Tự tạo ticket + portal để human giải.
+    /// Automatically create a ticket + portal for a human to solve it.
     Portal,
 }
 
@@ -37,7 +37,7 @@ impl OnChallenge {
     }
 }
 
-/// Đặc tả replay trích từ DOM: POST form nào, field nào, token điền vào đâu.
+/// Replay spec extracted from the DOM: which form to POST, which fields, where the token goes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplaySpec {
     pub post_url: String,
@@ -45,9 +45,10 @@ pub struct ReplaySpec {
     pub token_field: String,
 }
 
-/// Trích replay spec từ DOM: chọn form có hidden input + marker challenge,
-/// gom hidden input làm field, action làm post_url. Thuần generic — không biết
-/// site nào, chỉ biết cấu trúc form + marker chuẩn (recaptcha/hcaptcha/turnstile).
+/// Extract the replay spec from the DOM: pick the form with hidden inputs + a
+/// challenge marker, collect the hidden inputs as fields, use the action as post_url.
+/// Purely generic — it knows no site, only form structure + standard markers
+/// (recaptcha/hcaptcha/turnstile).
 pub fn auto_extract(dom: &Dom, page_url: &str) -> Option<ReplaySpec> {
     let forms = dom.query("form", 0).ok()?;
     let mut best: Option<(usize, usize)> = None;
@@ -144,7 +145,7 @@ pub(crate) fn now_ms() -> u64 {
 }
 static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// Ref trả cho agent: id ticket + URL portal để đưa human.
+/// Ref returned to the agent: ticket id + portal URL to hand to a human.
 #[derive(Debug, Clone, Serialize)]
 pub struct ChallengeRef {
     pub id: String,
@@ -191,7 +192,7 @@ pub fn lookup(store: &TicketStore, id: &str) -> Option<Ticket> {
     Some(t)
 }
 
-/// Kết quả replay: agent nhận URL đích nhưng solve() KHÔNG navigate tới đó bao giờ.
+/// Replay result: the agent gets the target URL but solve() NEVER navigates there.
 #[derive(Debug, Clone, Serialize)]
 pub struct ResolveOut {
     pub ok: bool,
@@ -199,8 +200,9 @@ pub struct ResolveOut {
     pub raw: String,
 }
 
-/// Replay token của human vào session: POST form (field trích từ DOM + token)
-/// rồi đọc URL đích từ response. Token dùng một lần — xong là ticket đóng.
+/// Replay the human's token into the session: POST the form (fields extracted from
+/// the DOM + the token), then read the target URL from the response. The token is
+/// single-use — once used, the ticket is closed.
 pub async fn solve(
     store: &TicketStore,
     sess: &mut crate::session::Session,
@@ -211,11 +213,11 @@ pub async fn solve(
 ) -> Result<ResolveOut, String> {
     let token = token.trim();
     if token.is_empty() {
-        return Err("token rỗng".into());
+        return Err("empty token".into());
     }
-    let t = lookup(store, id).ok_or_else(|| format!("ticket không tồn tại: `{id}`"))?;
+    let t = lookup(store, id).ok_or_else(|| format!("ticket does not exist: `{id}`"))?;
     if t.status != TicketStatus::Held {
-        return Err(format!("ticket `{id}` đã đóng ({:?})", t.status));
+        return Err(format!("ticket `{id}` is already closed ({:?})", t.status));
     }
     let mut parts: Vec<(String, String)> = t.spec.fields.clone();
     parts.push((t.spec.token_field.clone(), token.to_string()));
@@ -237,12 +239,12 @@ pub async fn solve(
             f.body
         }
         Err(e) => {
-            mark(store, id, TicketStatus::Failed, None, format!("replay lỗi mạng: {e}"));
-            return Err(format!("replay lỗi mạng: {e}"));
+            mark(store, id, TicketStatus::Failed, None, format!("replay network error: {e}"));
+            return Err(format!("replay network error: {e}"));
         }
     };
     let raw: String = out.chars().take(2000).collect();
-    // Response generic: thử JSON {success, url}, không ép shape của site nào.
+    // Generic response handling: try JSON {success, url}, never force any site's shape.
     let (ok, url) = match serde_json::from_str::<serde_json::Value>(&out) {
         Ok(v) => {
             let ok = v.get("success").and_then(|x| x.as_bool()).unwrap_or(false);
@@ -254,7 +256,7 @@ pub async fn solve(
     if ok {
         mark(store, id, TicketStatus::Resolved, url.clone(), String::new());
     } else {
-        mark(store, id, TicketStatus::Failed, None, format!("server từ chối (raw: {})", &raw[..raw.len().min(200)]));
+        mark(store, id, TicketStatus::Failed, None, format!("server rejected it (raw: {})", &raw[..raw.len().min(200)]));
     }
     Ok(ResolveOut { ok, url, raw })
 }
@@ -277,7 +279,7 @@ fn urlenc(s: &str) -> String {
     }
     o
 }
-/// Escape HTML khi nhúng giá trị vào portal.
+/// Escape HTML when embedding a value into the portal.
 fn esc(s: &str) -> String {
     let mut o = String::with_capacity(s.len());
     for c in s.chars() {
@@ -292,8 +294,8 @@ fn esc(s: &str) -> String {
     o
 }
 
-/// Trang portal cho human: mở trang thật, giải, dán token. Không tên site nào
-/// hardcode — mọi thứ lấy từ ticket.
+/// The portal page for the human: open the real page, solve it, paste the token.
+/// No site name is hardcoded — everything comes from the ticket.
 pub fn portal_page(t: &Ticket, ttl_left_s: u64) -> String {
     let host = t.page_url.split('/').nth(2).unwrap_or(&t.page_url);
     format!(
