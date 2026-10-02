@@ -77,7 +77,24 @@ pub async fn tool(srv: &Arc<crate::rpc::Server>, name: &str, p: &Value) -> Resul
             let mut m = srv.sessions.lock().unwrap();
             let sess = m.get_mut(&id).ok_or("session không tồn tại")?;
             let cfg = srv.config();
-            let r = crate::session::navigate(&url, &cfg, sess, &wait, run_js).await?;
+            let mut r = crate::session::navigate(&url, &cfg, sess, &wait, run_js).await?;
+            drop(m);
+            // on_challenge=portal: gặp challenge thì tạo ticket human-solve.
+            // Mặc định (ignore) chỉ gắn flag captcha, không làm gì thêm.
+            if crate::challenge::OnChallenge::from_str(&s(p, "on_challenge")) == crate::challenge::OnChallenge::Portal
+                && let Some(kind) = r.captcha.clone()
+            {
+                let m = srv.sessions.lock().unwrap();
+                if let Some(sess) = m.get(&id)
+                    && let Some(dom) = sess.dom.as_ref()
+                    && let Some(spec) = crate::challenge::auto_extract(&dom.borrow(), &r.final_url)
+                {
+                    let listen = srv.config().listen;
+                    r.challenge = Some(crate::challenge::create_ticket(
+                        &srv.challenges, &listen, &id, &r.final_url, &kind, spec,
+                    ));
+                }
+            }
             Ok(serde_json::to_value(&r).unwrap_or(Value::Null))
         }
         "extract_text" => {
@@ -201,6 +218,39 @@ pub async fn tool(srv: &Arc<crate::rpc::Server>, name: &str, p: &Value) -> Resul
             Ok(json!({ "installed": crate::plugin::install_from_dir(std::path::Path::new(&dir), &root)? }))
         }
 
+        // ---- human-solve challenge ----
+        "challenge_create" => {
+            let sid = s(p, "session");
+            let m = srv.sessions.lock().unwrap();
+            let sess = match m.get(&sid) {
+                Some(s) => s,
+                None => return Err(format!("session không tồn tại: `{sid}`")),
+            };
+            let dom = sess.dom.as_ref().ok_or("session chưa nạp trang nào")?.clone();
+            let kind = sess.last.as_ref().and_then(|r| r.captcha.clone()).unwrap_or("manual".into());
+            let page_url = sess.last.as_ref().map(|r| r.final_url.clone()).unwrap_or_default();
+            let spec = match p.get("post_url").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                Some(u) => crate::challenge::ReplaySpec {
+                    post_url: u.into(),
+                    fields: vec![],
+                    token_field: p.get("token_field").and_then(Value::as_str).unwrap_or("g-recaptcha-response").into(),
+                },
+                None => crate::challenge::auto_extract(&dom.borrow(), &page_url)
+                    .ok_or("không trích được form replay từ DOM (dùng post_url thủ công)")?,
+            };
+            drop(m);
+            let listen = srv.config().listen;
+            let t = crate::challenge::create_ticket(&srv.challenges, &listen, &sid, &page_url, &kind, spec);
+            Ok(json!({"id": t.id, "portal_url": t.portal_url, "kind": t.kind}))
+        }
+        "challenge_result" => {
+            let id = s(p, "id");
+            match crate::challenge::lookup(&srv.challenges, &id) {
+                Some(t) => Ok(json!({"id": t.id, "status": t.status, "url": t.url, "note": t.note})),
+                None => Err(format!("ticket không tồn tại: `{id}`")),
+            }
+        }
+
         // ---- bench ----
         "bench" => Ok(json!({ "note": "dùng CLI: f1stmux bench --compare <path>" })),
 
@@ -235,7 +285,9 @@ pub fn catalog() -> Value {
         {"name":"plugin_install","desc":"Cài plugin từ thư mục"},
         {"name":"plugin_info","desc":"Chi tiết một plugin"},
         {"name":"bench","desc":"Đo hiệu năng"},
-        {"name":"version","desc":"Phiên bản f1stmux + protocol"}
+        {"name":"version","desc":"Phiên bản f1stmux + protocol"},
+        {"name":"challenge_create","desc":"Tạo ticket human-solve cho challenge của session"},
+        {"name":"challenge_result","desc":"Trạng thái ticket (poll sau khi human giải)"}
     ])
 }
 
@@ -251,6 +303,7 @@ pub fn mcp_tools() -> Value {
             ("url", str_prop("URL cần mở")), ("session", str_prop("ID session")),
             ("js", bool_prop("Chạy JS của trang (mặc định true)")),
             ("quiet_ms", num_prop("Ngưỡng network-idle")), ("budget_ms", num_prop("Ngân sách ms")),
+            ("on_challenge", str_prop("\"portal\" = tự tạo ticket human-solve khi gặp challenge")),
         ], vec!["url"]),
         ("extract_text", "Trích text từ trang đang nạp", vec![opt_session.clone()], vec![]),
         ("snapshot_dom", "innerHTML của trang đang nạp", vec![opt_session.clone()], vec![]),
@@ -275,6 +328,14 @@ pub fn mcp_tools() -> Value {
         ("plugin_info", "Chi tiết một plugin", vec![("id", str_prop("ID plugin"))], vec!["id"]),
         ("bench", "Ghi chú: dùng CLI `f1stmux bench`", vec![], vec![]),
         ("version", "Phiên bản f1stmux + protocol", vec![], vec![]),
+        ("challenge_create", "Tạo ticket human-solve (trả portal_url cho human)", vec![
+            ("session", str_prop("ID session đã navigate tới trang challenge")),
+            ("post_url", str_prop("Ghi đè URL replay (mặc định auto-extract từ form)")),
+            ("token_field", str_prop("Tên field token (mặc định theo loại challenge)")),
+        ], vec!["session"]),
+        ("challenge_result", "Poll trạng thái ticket", vec![
+            ("id", str_prop("ID ticket")),
+        ], vec!["id"]),
     ];
     let tools: Vec<Value> = defs.into_iter().map(|(name, desc, props, req)| {
         let mut map = serde_json::Map::new();

@@ -56,6 +56,8 @@ pub struct NavResult {
     pub captcha: Option<String>,
     /// Chuỗi redirect đã đi qua (mỗi hop một URL). Debug shortener/shortlink chain.
     pub redirects: Vec<String>,
+    /// Ticket human-solve khi navigate với on_challenge=portal và gặp challenge.
+    pub challenge: Option<crate::challenge::ChallengeRef>,
 }
 
 #[derive(Default)]
@@ -289,6 +291,7 @@ pub async fn navigate(
         truncated: false,
         captcha,
         redirects: f.redirects.clone(),
+        challenge: None,
     };
 
     sess.dom = Some(dom.clone());

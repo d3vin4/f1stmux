@@ -65,7 +65,10 @@ f1stmux serve                   # daemon at 127.0.0.1:7070
 - `captcha` — `null` normally; otherwise one of `cloudflare`,
   `recaptcha`, `hcaptcha`, `turnstile`, `challenge-title`, `challenge-url`.
   **F1stmux does not solve captchas.** When set: rotate profile/proxy,
-  retry later, or escalate to the user.
+  retry later, escalate to the user — or pass `on_challenge: "portal"` to
+  `navigate` so a human can solve it via the loopback portal
+  (`challenge_create` / `challenge_result` tools). Solved destinations are
+  returned, never auto-opened.
 - `errors` — page JS errors (informational; static content still extracted)
 - `truncated`/`timed_out` — budgets hit; narrow the selector and re-query
 

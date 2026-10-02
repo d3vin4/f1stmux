@@ -6,6 +6,7 @@
 //! mặc định chỉ tồn tại trong RAM — thoát là mất sạch dấu vết.
 
 pub mod blocklist;
+pub mod challenge;
 pub mod cli;
 pub mod config;
 pub mod dom;

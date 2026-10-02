@@ -89,8 +89,12 @@ signal, so we never do it. Tracker/ad blocking via compact rule syntax
 
 Detected and reported, never silently ignored: `navigate` returns a
 `captcha` field (`cloudflare`, `recaptcha`, `hcaptcha`, `turnstile`, …).
-F1stmux does **not** solve challenges — rotate profile/proxy, retry later,
-or use the target's official API.
+F1stmux does **not** solve challenges — but it offers a human-solve portal:
+`navigate(url, on_challenge="portal")` creates a ticket and serves a
+loopback page where a person solves the challenge in a real browser, pastes
+the token, and f1stmux replays it into the session. The destination URL is
+returned, never auto-opened. Fake tokens are rejected by the target server,
+so only genuine human solves pass. See `challenge_create` / `challenge_result`.
 
 ## Plugins
 

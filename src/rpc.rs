@@ -18,11 +18,13 @@ pub struct Server {
     /// Mọi nơi đọc xong là clone + thả lock ngay, không giữ lock qua await.
     pub cfg: Mutex<Config>,
     pub sessions: Arc<Mutex<HashMap<String, Session>>>,
+    /// Ticket human-solve challenge (RAM, hết hạn 10 phút).
+    pub challenges: crate::challenge::TicketStore,
 }
 
 impl Server {
     pub fn new(cfg: Config) -> Self {
-        Self { cfg: Mutex::new(cfg), sessions: Arc::new(Mutex::new(HashMap::new())) }
+        Self { cfg: Mutex::new(cfg), sessions: Arc::new(Mutex::new(HashMap::new())), challenges: crate::challenge::new_store() }
     }
 
     pub fn config(&self) -> Config {
@@ -100,6 +102,102 @@ async fn handle(srv: Arc<Server>, mut sock: tokio::net::TcpStream) -> Result<(),
 }
 
 async fn route(srv: &Arc<Server>, req: &Req) -> (&'static str, &'static str, String) {
+/// POST /challenge {session, post_url?, token_field?} → tạo ticket human-solve.
+/// post_url cho trước thì dùng thẳng, không thì auto-extract từ DOM của session.
+async fn challenge_create_http(srv: &Arc<Server>, body: &str) -> (&'static str, &'static str, String) {
+    let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    let sid = v.get("session").and_then(Value::as_str).unwrap_or("");
+    let m = srv.sessions.lock().unwrap();
+    let sess = match m.get(sid) {
+        Some(s) => s,
+        None => return ("404 Not Found", "text/plain; charset=utf-8", "session không tồn tại".into()),
+    };
+    let dom = match sess.dom.as_ref() {
+        Some(d) => d.clone(),
+        None => return ("422 Unprocessable", "text/plain; charset=utf-8", "session chưa nạp trang nào".into()),
+    };
+    let kind = sess.last.as_ref().and_then(|r| r.captcha.clone()).unwrap_or("manual".into());
+    let page_url = sess.last.as_ref().map(|r| r.final_url.clone()).unwrap_or_default();
+    let spec = match v.get("post_url").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+        Some(u) => crate::challenge::ReplaySpec {
+            post_url: u.into(),
+            fields: vec![],
+            token_field: v.get("token_field").and_then(Value::as_str).unwrap_or("g-recaptcha-response").into(),
+        },
+        None => match crate::challenge::auto_extract(&dom.borrow(), &page_url) {
+            Some(s) => s,
+            None => return ("422 Unprocessable", "text/plain; charset=utf-8", "không trích được form replay từ DOM".into()),
+        },
+    };
+    drop(m);
+    let listen = srv.config().listen;
+    let t = crate::challenge::create_ticket(&srv.challenges, &listen, sid, &page_url, &kind, spec);
+    json(json!({"id": t.id, "portal_url": t.portal_url, "kind": t.kind}))
+}
+
+/// POST /challenge/:id/solution {token} (JSON hoặc urlencoded từ portal form)
+/// → replay vào session, trả {ok, url?, raw?}. Không bao giờ navigate tới đích.
+async fn challenge_solution_http(srv: &Arc<Server>, id: &str, body: &str) -> (&'static str, &'static str, String) {
+    let token = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| v.get("token").and_then(Value::as_str).map(str::to_string))
+        .or_else(|| {
+            body.split('&').find_map(|p| {
+                let (k, v) = p.split_once('=')?;
+                (k.trim() == "token").then(|| v.trim().to_string())
+            })
+        })
+        .unwrap_or_default();
+    // URL-decode tối thiểu cho form portal (token thường là base64url, ít ký tự lạ).
+    let token = percent_decode(&token.replace('+', " "));
+    let sess_id = match crate::challenge::lookup(&srv.challenges, id) {
+        Some(t) => t.session.clone(),
+        None => return ("404 Not Found", "text/plain; charset=utf-8", "ticket không tồn tại".into()),
+    };
+    let cfg = srv.config();
+    let prof_name = cfg.profile.clone();
+    let mut m = srv.sessions.lock().unwrap();
+    let sess = match m.get_mut(sess_id.as_str()) {
+        Some(s) => s,
+        None => return ("410 Gone", "text/plain; charset=utf-8", "session của ticket đã đóng".into()),
+    };
+    let prof = match crate::stealth::profile(&prof_name) {
+        Some(p) => p,
+        None => return ("500 Internal", "text/plain; charset=utf-8", "profile cấu hình không tồn tại".into()),
+    };
+    match crate::challenge::solve(&srv.challenges, sess, &cfg, prof, id, &token).await {
+        Ok(o) => json(serde_json::to_value(&o).unwrap_or(Value::Null)),
+        Err(e) => ("422 Unprocessable", "application/json; charset=utf-8", json!({"ok": false, "error": e}).to_string()),
+    }
+}
+
+fn percent_decode(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() + 1 {
+            if let (Some(h), Some(l)) = (hex(b.get(i + 1)), hex(b.get(i + 2))) {
+                o.push((h << 4 | l) as char);
+                i += 3;
+                continue;
+            }
+        }
+        o.push(b[i] as char);
+        i += 1;
+    }
+    o
+}
+
+fn hex(c: Option<&u8>) -> Option<u8> {
+    let c = *c?;
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
     // ---- DevTools frontend ----
     if req.path == "/devtools" || req.path == "/devtools/" {
         let ws = format!("ws://{}", srv.config().listen);
@@ -125,6 +223,35 @@ async fn route(srv: &Arc<Server>, req: &Req) -> (&'static str, &'static str, Str
     if req.path == "/cdp" && req.method == "POST" {
         let v: Value = serde_json::from_str(&req.body).unwrap_or(Value::Null);
         return json(cdp(srv, &v).await);
+    }
+
+    // ---- Human-solve challenge portal (loopback, không log token) ----
+    if req.path == "/challenge" && req.method == "POST" {
+        return challenge_create_http(srv, &req.body).await;
+    }
+    if let Some(rest) = req.path.strip_prefix("/challenge/") {
+        let mut it = rest.splitn(2, '/');
+        let (id, tail) = (it.next().unwrap_or(""), it.next().unwrap_or(""));
+        if tail.is_empty() && req.method == "GET" {
+            return match crate::challenge::lookup(&srv.challenges, id) {
+                Some(t) => {
+                    let ttl = crate::challenge::TICKET_TTL_MS.saturating_sub(
+                        crate::challenge::now_ms().saturating_sub(t.created_ms),
+                    ) / 1000;
+                    ("200 OK", "text/html; charset=utf-8", crate::challenge::portal_page(&t, ttl))
+                }
+                None => ("404 Not Found", "text/plain; charset=utf-8", "ticket không tồn tại".into()),
+            };
+        }
+        if tail == "solution" && req.method == "POST" {
+            return challenge_solution_http(srv, id, &req.body).await;
+        }
+        if tail == "result" && req.method == "GET" {
+            return match crate::challenge::lookup(&srv.challenges, id) {
+                Some(t) => json(json!({"id": t.id, "status": t.status, "url": t.url, "note": t.note})),
+                None => ("404 Not Found", "text/plain; charset=utf-8", "ticket không tồn tại".into()),
+            };
+        }
     }
 
     // ---- JSON-RPC ----
