@@ -17,6 +17,9 @@ struct Cli {
     /// Proxy http/https/socks5.
     #[arg(long, global = true)]
     proxy: Option<String>,
+    /// Cho phép daemon bind địa chỉ remote (mặc định chỉ loopback, vì daemon không auth).
+    #[arg(long, global = true)]
+    allow_remote: bool,
 }
 
 #[derive(Subcommand)]
@@ -65,6 +68,7 @@ async fn main() {
     let mut cfg = Config::load(cli.config.as_deref());
     if let Some(p) = cli.profile { cfg.profile = p; }
     if let Some(p) = cli.proxy { cfg.proxy = Some(p); }
+    if cli.allow_remote { cfg.allow_remote = true; }
 
     // Provider TLS phải cài trước mọi thứ. Xem src/net.rs.
     f1stmux::net::init_tls();

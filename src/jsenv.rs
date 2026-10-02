@@ -4,7 +4,10 @@
 use crate::dom::Dom;
 use rquickjs::{Context, Ctx, Function, Object, Runtime, Value};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 /// Kết quả chạy JS trên trang.
 #[derive(Debug, Default)]
@@ -25,26 +28,54 @@ pub struct Realm {
     errors: Rc<RefCell<Vec<String>>>,
     timers: Rc<RefCell<usize>>,
     pub deadline: std::time::Instant,
+    deadline_ms: Arc<AtomicU64>,
+    steps: Arc<AtomicUsize>,
 }
 
-/// Thông tin môi trường JS — truyền vào để lớp vờ DOM dựng global cho khớp profile.
+/// Storage của đúng một session — không còn global thread-local dùng chung.
+/// Session sở hữu map này và truyền clone vào mỗi Realm nó tạo.
+pub type SessionStore = Rc<RefCell<HashMap<String, String>>>;
+
+pub fn new_store() -> SessionStore {
+    Rc::new(RefCell::new(HashMap::new()))
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Thông tin môi trường JS — owned String, không Box::leak.
 pub struct Env {
-    pub ua: &'static str,
-    pub platform: &'static str,
+    pub ua: String,
+    pub platform: String,
     pub concurrency: u32,
     pub device_memory: u32,
     pub screen: (u32, u32),
-    pub title: &'static str,
-    pub url: &'static str,
-    pub cookie: &'static str,
-    pub timezone: &'static str,
+    pub title: String,
+    pub url: String,
+    pub cookie: String,
+    pub timezone: String,
 }
 
 impl Realm {
-    pub fn new(dom: Rc<RefCell<Dom>>, e: &Env) -> rquickjs::Result<Self> {
+    pub fn new(dom: Rc<RefCell<Dom>>, e: &Env, store: SessionStore) -> rquickjs::Result<Self> {
         let rt = Runtime::new()?;
         rt.set_memory_limit(128 * 1024 * 1024);
         rt.set_max_stack_size(4 * 1024 * 1024);
+        // Interrupt handler thật: QuickJS gọi định kỳ trong eval; trả true là dừng.
+        // Đây mới là ngân sách bước/thời gian có răng — MAX_STEPS trước đây chỉ là hằng số treo.
+        let deadline_ms = Arc::new(AtomicU64::new(now_ms() + 10_000));
+        let steps = Arc::new(AtomicUsize::new(0));
+        {
+            let dl = deadline_ms.clone();
+            let st = steps.clone();
+            rt.set_interrupt_handler(Some(Box::new(move || {
+                st.fetch_add(1, Ordering::Relaxed) > MAX_STEPS || now_ms() > dl.load(Ordering::Relaxed)
+            })));
+        }
         let ctx = Context::full(&rt)?;
 
         let console = Rc::new(RefCell::new(Vec::new()));
@@ -52,10 +83,11 @@ impl Realm {
         let timers = Rc::new(RefCell::new(0usize));
 
         // Copy ra khỏi `e` để closure trong `with` không mượn `e`.
+        // (Trước đây Box::leak chuỗi ở caller — rò rỉ vĩnh viễn mỗi navigation.)
         let (ua, platform, conc, mem, sw, sh, title, url, cookie, tz) = (
-            e.ua, e.platform, e.concurrency, e.device_memory,
+            e.ua.clone(), e.platform.clone(), e.concurrency, e.device_memory,
             e.screen.0 as f64, e.screen.1 as f64,
-            e.title, e.url, e.cookie, e.timezone,
+            e.title.clone(), e.url.clone(), e.cookie.clone(), e.timezone.clone(),
         );
 
         ctx.with(|ctx: Ctx| -> rquickjs::Result<()> {
@@ -150,10 +182,22 @@ impl Realm {
 
             // Storage: không trả Object từ function (rquickjs lifetime invariant).
             // Expose 4 hàm nguyên thủy; dom.js bọc thành localStorage/sessionStorage.
-            host.set("storageGet", Function::new(ctx.clone(), move |k: String| hstorage::get(&k))?)?;
-            host.set("storageSet", Function::new(ctx.clone(), move |k: String, v: String| { hstorage::set(&k, &v); })?)?;
-            host.set("storageRemove", Function::new(ctx.clone(), move |k: String| { hstorage::clear_key(&k); })?)?;
-            host.set("storageClear", Function::new(ctx.clone(), move || hstorage::clear())?)?;
+            host.set("storageGet", Function::new(ctx.clone(), {
+                let s = store.clone();
+                move |k: String| s.borrow().get(&k).cloned()
+            })?)?;
+            host.set("storageSet", Function::new(ctx.clone(), {
+                let s = store.clone();
+                move |k: String, v: String| { s.borrow_mut().insert(k, v); }
+            })?)?;
+            host.set("storageRemove", Function::new(ctx.clone(), {
+                let s = store.clone();
+                move |k: String| { s.borrow_mut().remove(&k); }
+            })?)?;
+            host.set("storageClear", Function::new(ctx.clone(), {
+                let s = store.clone();
+                move || s.borrow_mut().clear()
+            })?)?;
 
             {
                 let c = console.clone();
@@ -180,7 +224,17 @@ impl Realm {
             errors,
             timers,
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(10),
+            deadline_ms: deadline_ms.clone(),
+            steps: steps.clone(),
         })
+    }
+
+    /// Đặt lại ngân sách JS (ms kể từ giờ) cho cả Instant field lẫn interrupt handler.
+    /// Dùng để nối `budget_ms` của client vào — deadline cứng 10s trước đây bỏ qua nó.
+    pub fn set_deadline_ms(&mut self, budget_ms: u64) {
+        let budget_ms = budget_ms.clamp(500, 120_000);
+        self.deadline = std::time::Instant::now() + std::time::Duration::from_millis(budget_ms);
+        self.deadline_ms.store(now_ms() + budget_ms, Ordering::Relaxed);
     }
 
     /// Chạy script. Lỗi được thu thập kèm message+stack thật (qua String()),
@@ -215,8 +269,14 @@ impl Realm {
         let s: Result<String, _> = self.ctx.with(|c| c.eval(wrapped));
         let s = match s {
             Ok(s) => s,
-            // JSON.stringify(undefined) → undefined, không phải string.
-            Err(_) => return Ok(serde_json::Value::Null),
+            // Phân biệt interrupt/timeout với "expression không giá trị":
+            // stringify(undefined) cũng Err, nhưng ngân sách vượt là lỗi thật.
+            Err(e) => {
+                if self.expired() || self.steps.load(Ordering::Relaxed) > MAX_STEPS {
+                    return Err(format!("JS vượt ngân sách (vòng lặp vô hạn hoặc quá nặng): {e}"));
+                }
+                return Ok(serde_json::Value::Null);
+            }
         };
         let v: serde_json::Value = serde_json::from_str(&s).map_err(|e| e.to_string())?;
         if let Some(msg) = v.get("err").and_then(|m| m.as_str()) {
@@ -237,19 +297,6 @@ impl Realm {
             timed_out: self.expired(),
         }
     }
-}
-
-/// Storage tĩnh, đủ cho script trang kiểm tra sự tồn tại.
-pub mod hstorage {
-    use std::cell::RefCell;
-    thread_local! {
-        static KV: RefCell<std::collections::HashMap<String, String>> = RefCell::new(std::collections::HashMap::new());
-    }
-    pub fn get(k: &str) -> Option<String> { KV.with(|m| m.borrow().get(k).cloned()) }
-    pub fn set(k: &str, v: &str) { KV.with(|m| m.borrow_mut().insert(k.into(), v.into())); }
-    pub fn clear() { KV.with(|m| m.borrow_mut().clear()); }
-    pub fn clear_key(k: &str) { KV.with(|m| { m.borrow_mut().remove(k); }); }
-    pub fn all() -> std::collections::HashMap<String, String> { KV.with(|m| m.borrow().clone()) }
 }
 
 pub const DOM_JS: &str = include_str!("../assets/dom.js");

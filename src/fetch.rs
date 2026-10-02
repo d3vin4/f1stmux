@@ -219,19 +219,24 @@ fn decode_text(b: &[u8], headers: &[(String, String)]) -> String {
 }
 
 /// Quét <meta charset="..."> hoặc <meta ... content="...charset=..."> trong 2 KB đầu.
-/// Chỉ ASCII nên so trực tiếp trên byte, không cần decode trước.
+/// Duyệt MỌI thẻ meta (không dừng ở thẻ đầu — thẻ đầu có thể là viewport).
 fn meta_charset(b: &[u8]) -> Option<String> {
     let head = &b[..b.len().min(2048)];
     let lower: Vec<u8> = head.iter().map(|c| c.to_ascii_lowercase()).collect();
     let s = std::str::from_utf8(&lower).ok()?;
-    let i = s.find("<meta")?;
-    let tag = &s[i..s[i..].find('>')? + i];
-    if let Some(j) = tag.find("charset=") {
-        let v = tag[j + 8..].trim_start_matches([' ', '"', '\'']);
-        let end = v.find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == ':')).unwrap_or(v.len());
-        if !v[..end].is_empty() {
-            return Some(v[..end].to_string());
+    let mut rest = s;
+    while let Some(i) = rest.find("<meta") {
+        let tag = &rest[i..];
+        let end = tag.find('>')?;
+        let tag = &tag[..end];
+        if let Some(j) = tag.find("charset=") {
+            let v = tag[j + 8..].trim_start_matches([' ', '"', '\'']);
+            let end = v.find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == ':')).unwrap_or(v.len());
+            if !v[..end].is_empty() {
+                return Some(v[..end].to_string());
+            }
         }
+        rest = &rest[i + 5..];
     }
     None
 }
@@ -335,8 +340,8 @@ impl CookieJar {
                 path_matches(path, &c.path)
             })
             .collect();
-        // Cookie path cụ thể hơn thì gửi trước, giống browser.
-        out.sort_by_key(|c| c.path.len());
+        // Cookie path cụ thể hơn thì gửi trước (RFC 6265 §5.4), dài trước ngắn sau.
+        out.sort_by(|a, b| b.path.len().cmp(&a.path.len()));
         out
     }
 }
@@ -392,10 +397,24 @@ fn parse_set_cookie(base: &reqwest::Url, line: &str, now: u64) -> Option<Cookie>
         match k.as_str() {
             "domain" => {
                 let d = v.trim_start_matches('.').to_ascii_lowercase();
-                if !d.is_empty() {
-                    c.domain = d;
-                    c.host_only = false;
+                // RFC 6265 §5.3: origin chỉ được đặt cookie cho chính nó hoặc
+                // domain cha của nó. evil.com không được Domain=victim.com.
+                // IP literal không được dùng Domain (trừ chính nó).
+                if d.is_empty() {
+                    continue;
                 }
+                let host_is_ip = host.parse::<std::net::IpAddr>().is_ok();
+                let ok = host == d
+                    || (!host_is_ip
+                        && d.parse::<std::net::IpAddr>().is_err()
+                        && host.len() > d.len()
+                        && host.ends_with(d.as_str())
+                        && host.as_bytes()[host.len() - d.len() - 1] == b'.');
+                if !ok {
+                    return None;
+                }
+                c.domain = d;
+                c.host_only = false;
             }
             "path" => {
                 if v.starts_with('/') {

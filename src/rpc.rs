@@ -14,19 +14,35 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 pub struct Server {
-    pub cfg: Config,
+    /// Config khóa được để tool stealth_profile đổi thật lúc runtime.
+    /// Mọi nơi đọc xong là clone + thả lock ngay, không giữ lock qua await.
+    pub cfg: Mutex<Config>,
     pub sessions: Arc<Mutex<HashMap<String, Session>>>,
 }
 
 impl Server {
     pub fn new(cfg: Config) -> Self {
-        Self { cfg, sessions: Arc::new(Mutex::new(HashMap::new())) }
+        Self { cfg: Mutex::new(cfg), sessions: Arc::new(Mutex::new(HashMap::new())) }
+    }
+
+    pub fn config(&self) -> Config {
+        self.cfg.lock().unwrap().clone()
     }
 }
 
 pub async fn serve(cfg: Config) -> Result<(), String> {
+    // Daemon không auth: bind remote mà không tường minh là tự mở control plane
+    // (navigate/plugin/install) cho cả mạng. Fail-closed trừ khi --allow-remote.
+    if cfg.is_remote_bind() && !cfg.allow_remote {
+        return Err(format!(
+            "từ chối bind {0}: không phải loopback mà thiếu allow_remote. \
+             Daemon không có auth — chỉ mở remote khi bạn hiểu rõ rủi ro \
+             (--allow-remote hoặc \"allow_remote\": true trong config)",
+            cfg.listen
+        ));
+    }
     let srv = Arc::new(Server::new(cfg));
-    let addr = srv.cfg.listen.clone();
+    let addr = srv.config().listen;
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .map_err(|e| format!("không bind được {addr}: {e}"))?;
@@ -86,7 +102,7 @@ async fn handle(srv: Arc<Server>, mut sock: tokio::net::TcpStream) -> Result<(),
 async fn route(srv: &Arc<Server>, req: &Req) -> (&'static str, &'static str, String) {
     // ---- DevTools frontend ----
     if req.path == "/devtools" || req.path == "/devtools/" {
-        let ws = format!("ws://{}", srv.cfg.listen);
+        let ws = format!("ws://{}", srv.config().listen);
         return ("200 OK", "text/html; charset=utf-8", crate::inspector::index_html(&ws));
     }
     if req.path == "/devtools/inspector.html" {
@@ -99,7 +115,7 @@ async fn route(srv: &Arc<Server>, req: &Req) -> (&'static str, &'static str, Str
         let s = srv.sessions.lock().unwrap();
         let last = s.values().find_map(|x| x.last.as_ref());
         return json(crate::inspector::list_json(
-            &format!("ws://{}", srv.cfg.listen),
+            &format!("ws://{}", srv.config().listen),
             last.map(|r| r.title.as_str()).unwrap_or("F1stmux"),
             last.map(|r| r.final_url.as_str()).unwrap_or("about:blank"),
         ));

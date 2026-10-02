@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 /// Điểm vào cho DevTools frontend: `/json/list`, `/json/version`.
 pub fn version_json() -> Value {
     json!({
-        "Browser": "F1stmux/0.1.0",
+        "Browser": concat!("F1stmux/", env!("CARGO_PKG_VERSION")),
         "Protocol-Version": "1.3",
         "User-Agent": "F1stmux",
         "V8-Version": "QuickJS",
@@ -29,14 +29,15 @@ pub fn version_json() -> Value {
 }
 
 /// Target cho DevTools frontend để attach. Chỉ một target: daemon ảo.
-pub fn list_json(ws_base: &str, page_title: &str, page_url: &str) -> Value {
+/// Inspection qua HTTP POST /cdp — không có WebSocket upgrade nên không quảng cáo ws nữa.
+pub fn list_json(_ws_base: &str, page_title: &str, page_url: &str) -> Value {
     json!([{
         "description": "",
         "devtoolsFrontendUrl": "/devtools/inspector.html",
         "id": "F1STMUX-TAB-0",
         "title": page_title,
         "url": page_url,
-        "webSocketDebuggerUrl": format!("{ws_base}/cdp"),
+        "webSocketDebuggerUrl": null,
         "type": "page",
         "faviconUrl": ""
     }])
@@ -107,8 +108,8 @@ pub fn to_har(entries: &[NetEntry]) -> Value {
 
     json!({ "log": {
         "version": "1.2",
-        "creator": { "name": "F1stmux", "version": "0.1.0" },
-        "browser": { "name": "F1stmux", "version": "0.1.0" },
+        "creator": { "name": "F1stmux", "version": env!("CARGO_PKG_VERSION") },
+        "browser": { "name": "F1stmux", "version": env!("CARGO_PKG_VERSION") },
         "pages": [],
         "entries": log
     }})
@@ -132,7 +133,7 @@ pub struct NetEntry {
 
 /// DevTools frontend thật (chrome-devtools-frontend) được bundle vào binary.
 /// Nếu người dùng không đưa bản frontend vào, daemon phục vụ fallback nhẹ bên dưới.
-pub fn index_html(ws: &str) -> String {
+pub fn index_html(_ws: &str) -> String {
     format!(
         r#"<!doctype html>
 <html lang="vi">
@@ -196,29 +197,24 @@ pub fn index_html(ws: &str) -> String {
 <div class="panel" id="p-console"><div id="console" class="muted"></div></div>
 <div class="panel" id="p-network"><div class="bar" id="nbar"></div><div id="net" class="muted"></div></div>
 <script>
-const WS = {ws:?};
-let sock = null;
-const pending = {{}};
+// CDP qua HTTP POST — daemon single-thread không có WebSocket upgrade,
+// nên frontend nói HTTP thay vì ws:// (trước đây quảng cáo WS nhưng không chạy).
+const BASE = location.origin;
 let id = 0;
 
 function send(method, params) {{
-  return new Promise((res) => {{
-    const i = ++id;
-    pending[i] = res;
-    sock.send(JSON.stringify({{id: i, method, params: params || {{}}}}));
-  }});
+  const i = ++id;
+  return fetch(BASE + '/cdp', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{id: i, method, params: params || {{}}}}),
+  }}).then((r) => r.json());
 }}
 
 function connect() {{
-  sock = new WebSocket(WS);
-  sock.onmessage = (ev) => {{
-    const m = JSON.parse(ev.data);
-    if (m.id && pending[m.id]) {{ pending[m.id](m); delete pending[m.id]; }}
-  }};
-  sock.onopen = async () => {{
-    await send('DOM.getDocument', {{depth: -1}}).then(refresh);
-    await loadAll();
-  }};
+  send('DOM.getDocument', {{depth: -1}}).then(refresh).then(loadAll).catch((e) => {{
+    document.getElementById('dom').textContent = 'Không nối được daemon: ' + e;
+  }});
 }}
 
 async function refresh(r) {{
@@ -286,8 +282,7 @@ function dlDom() {{
 connect();
 </script>
 </body>
-</html>"#,
-        ws = ws
+</html>"#
     )
 }
 

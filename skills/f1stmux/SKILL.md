@@ -31,7 +31,7 @@ For opencode (`opencode.json`):
 }
 ```
 
-You get 17 tools. The ones you will use daily:
+You get 18 tools. The ones you will use daily:
 
 | Tool | Purpose |
 |---|---|
@@ -42,8 +42,10 @@ You get 17 tools. The ones you will use daily:
 | `network_log` / `har_export` | What the page actually requested |
 | `blocklist_test` | Check if a URL would be blocked |
 
-Sessions are RAM-only. Pass `session` to keep cookies across calls;
-omit it to start fresh. `session_close` wipes all traces.
+Sessions are RAM-only, isolated per session (cookies, JS storage, network
+log). Pass `session` to keep state across calls; omit it to start fresh.
+Unknown session IDs are an error, never a silent new session.
+`session_close` wipes all traces. `eval_js` throws are tool errors, not nulls.
 
 **2. CLI (scripts, debugging).**
 

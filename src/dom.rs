@@ -71,7 +71,7 @@ impl Dom {
                 out.push(' ');
                 out.push_str(k);
                 out.push_str("=\"");
-                out.push_str(v);
+                out.push_str(&escape_attr(v));
                 out.push('"');
             }
             out.push('>');
@@ -188,21 +188,21 @@ impl Dom {
         let mut i = 0;
         while i < b.len() {
             match b[i] {
-                b'#' => { let (s, n) = token(b, i + 1); id_sel = s; i = n; }
-                b'.' => { let (s, n) = token(b, i + 1); classes.push(s); i = n; }
+                b'#' => { let (s, n) = token(simple, i + 1); id_sel = s; i = n; }
+                b'.' => { let (s, n) = token(simple, i + 1); classes.push(s); i = n; }
                 b'[' => {
                     let close = simple[i..].find(']').map(|p| i + p).unwrap_or(b.len());
                     attrs.push(&simple[i + 1..close]);
                     i = close + 1;
                 }
                 _ => {
-                    let (s, n) = token(b, i);
+                    let (s, n) = token(simple, i);
                     tag = s;
                     i = n;
                 }
             }
         }
-        if !tag.is_empty() && n.name != tag { return false; }
+        if !tag.is_empty() && tag != "*" && n.name != tag { return false; }
         if !id_sel.is_empty() {
             match n.attrs.iter().find(|(k, _)| k == "id") {
                 Some((_, v)) if v == id_sel => {}
@@ -225,12 +225,31 @@ impl Dom {
     }
 }
 
-fn token(b: &[u8], mut i: usize) -> (&str, usize) {
+/// Cắt token selector tại vị trí byte. Mọi vị trí cắt đều nằm ngay trước một
+/// ký tự ASCII (# . [) hoặc cuối chuỗi, nên luôn là biên ký tự UTF-8 hợp lệ —
+/// không cần `unsafe`, slice trực tiếp trên &str đã đủ.
+fn token(s: &str, mut i: usize) -> (&str, usize) {
+    let b = s.as_bytes();
     let start = i;
     while i < b.len() && !matches!(b[i], b'#' | b'.' | b'[') {
         i += 1;
     }
-    (unsafe { std::str::from_utf8_unchecked(&b[start..i]) }, i)
+    (&s[start..i], i)
+}
+
+/// Escape giá trị attribute khi serialize: không escape là ra HTML vỡ.
+fn escape_attr(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    for c in v.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 static VOID: &[&str] = &["area","base","br","col","embed","hr","img","input","link","meta","source","track","wbr"];

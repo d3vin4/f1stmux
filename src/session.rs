@@ -68,16 +68,13 @@ pub struct Session {
     pub realm: Option<Box<Realm>>,
     pub last: Option<NavResult>,
     pub kill_switch: bool,
+    /// Storage JS của riêng session này — Realm nào của session cũng dùng chung map.
+    pub js_store: crate::jsenv::SessionStore,
 }
 
 impl Session {
     pub fn new() -> Self {
-        Self { id: new_id("s"), ..Default::default() }
-    }
-
-    /// Lưu trữ JS vào cookie jar — không vào đĩa.
-    pub fn persist_dom(&self) {
-        let _ = crate::jsenv::hstorage::all();
+        Self { id: new_id("s"), js_store: crate::jsenv::new_store(), ..Default::default() }
     }
 
     pub fn snapshot(&self) -> serde_json::Value {
@@ -85,7 +82,7 @@ impl Session {
             "id": self.id,
             "cookies": self.cookies.len(),
             "network": self.net.len(),
-            "storage_keys": self.storage.len(),
+            "storage_keys": self.js_store.borrow().len(),
             "dom_loaded": self.dom.is_some(),
             "last": self.last.as_ref().map(|r| json!({
                 "url": r.final_url, "status": r.status, "title": r.title,
@@ -133,7 +130,7 @@ pub async fn navigate(
     url: &str,
     cfg: &Config,
     sess: &mut Session,
-    _wait: &WaitFor,
+    wait: &WaitFor,
     run_js: bool,
 ) -> Result<NavResult, String> {
     let prof = stealth::profile(&cfg.profile).ok_or_else(|| {
@@ -141,6 +138,12 @@ pub async fn navigate(
     })?;
 
     let t0 = std::time::Instant::now();
+    // Blocklist là policy thật, không phải nút test: document bị chặn thì dừng ngay,
+    // script con bị chặn thì bỏ qua + ghi chú (trang chính vẫn đọc được).
+    let bl = crate::blocklist::Blocklist::new();
+    if let crate::blocklist::Decision::Block { rule } = bl.decide(url, crate::blocklist::ResourceKind::Document) {
+        return Err(format!("bị blocklist chặn ({rule}): {url}"));
+    }
     let cookie = sess.cookies.header_for(url);
     let f = crate::fetch::get(url, cfg, prof, &cookie).await?;
 
@@ -155,18 +158,21 @@ pub async fn navigate(
     let scripts = parsed.scripts.clone();
 
     let env = Env {
-        ua: prof.ua,
-        platform: prof.platform,
+        ua: prof.ua.to_string(),
+        platform: prof.platform.to_string(),
         concurrency: prof.hardware_concurrency,
         device_memory: prof.device_memory,
         screen: prof.screen,
-        title: Box::leak(title0.clone().into_boxed_str()),
-        url: Box::leak(f.final_url.clone().into_boxed_str()),
-        cookie: Box::leak(sess.cookies.visible_for_js(&f.final_url).into_boxed_str()),
-        timezone: prof.timezone,
+        title: title0.clone(),
+        url: f.final_url.clone(),
+        cookie: sess.cookies.visible_for_js(&f.final_url),
+        timezone: prof.timezone.to_string(),
     };
 
-    let realm = Realm::new(dom.clone(), &env).map_err(|e| format!("QuickJS: {e}"))?;
+    let mut realm = Realm::new(dom.clone(), &env, sess.js_store.clone()).map_err(|e| format!("QuickJS: {e}"))?;
+    // Nối ngân sách client vào thay vì deadline cứng — quiet_ms không áp dụng được
+    // vì JS trong realm chạy đồng bộ, không có network nền để "idle".
+    realm.set_deadline_ms(wait.budget_ms);
     realm.run(crate::jsenv::DOM_JS, "dom.js");
 
     let mut console = Vec::new();
@@ -194,11 +200,27 @@ pub async fn navigate(
                         .unwrap_or_default();
                     if full.is_empty() || !(full.starts_with("http://") || full.starts_with("https://")) {
                         errors.push(format!("page:{src}: URL script không hợp lệ"));
+                    } else if let crate::blocklist::Decision::Block { rule } =
+                        bl.decide(&full, crate::blocklist::ResourceKind::Script)
+                    {
+                        errors.push(format!("page:{full}: bỏ qua script bị blocklist chặn ({rule})"));
                     } else {
                         let ck = sess.cookies.header_for(&full);
                         match crate::fetch::get(&full, cfg, prof, &ck).await {
                             Ok(sf) => {
                                 sess.cookies.set_from_headers(&sf.final_url, &sf.headers);
+                                sess.net.push(NetEntry {
+                                    url: full.clone(),
+                                    method: "GET".into(),
+                                    status: sf.status,
+                                    req_headers: vec![],
+                                    resp_headers: sf.headers.clone(),
+                                    mime: sf.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("content-type")).map(|(_, v)| v.clone()).unwrap_or_default(),
+                                    body_len: sf.body.len(),
+                                    req_body: 0,
+                                    elapsed_ms: sf.elapsed_ms,
+                                    started_ms: inspector::now_ms(),
+                                });
                                 realm.run(&sf.body, &format!("page:{full}"));
                             }
                             Err(e) => errors.push(format!("page:{full}: {e}")),
@@ -240,16 +262,21 @@ pub async fn navigate(
         started_ms: inspector::now_ms() - f.elapsed_ms.min(u128::from(u64::MAX)) as u64,
     };
     sess.net.push(net);
-    sess.persist_dom();
 
     let html = dom.borrow().inner_html(0);
-    let captcha = detect_captcha(&f.final_url, &title0, &f.body);
+    // Title cuối từ DOM sau JS — script đổi <title> thì báo đúng, không dùng title parse cũ.
+    let title_final = dom.borrow().query("title", 0).ok()
+        .and_then(|ids| ids.into_iter().next())
+        .map(|id| dom.borrow().text_content(id))
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or(title0);
+    let captcha = detect_captcha(&f.final_url, &title_final, &f.body);
     let res = NavResult {
         tab: sess.id.clone(),
         url: f.url.clone(),
         final_url: f.final_url.clone(),
         status: f.status,
-        title: title0,
+        title: title_final,
         text,
         html_len: html.len(),
         html,

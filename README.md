@@ -31,7 +31,7 @@ close it and every cookie, cache entry, and trace is gone.
 Requires Rust (1.85+) and `libclang` for the QuickJS bindings:
 
 ```sh
-git clone https://github.com/<you>/f1stmux
+git clone https://github.com/d3vin4/f1stmux
 cd f1stmux
 cargo build --release
 ./target/release/f1stmux --help
@@ -48,7 +48,7 @@ cargo build --release
 { "mcpServers": { "f1stmux": { "command": "f1stmux", "args": ["mcp"] } } }
 ```
 
-17 tools: `navigate`, `query`, `eval_js`, `extract_text`, `snapshot_dom`,
+18 tools: `navigate`, `query`, `eval_js`, `extract_text`, `snapshot_dom`,
 `network_log`, `har_export`, `blocklist_test`, `stealth_profile`,
 session management, plugin management. See
 [`skills/f1stmux/SKILL.md`](skills/f1stmux/SKILL.md) for the agent guide.
@@ -56,6 +56,12 @@ session management, plugin management. See
 **HTTP.** `f1stmux serve` exposes JSON-RPC 2.0 at `/rpc`, a CDP subset
 at `/cdp`, and a web DevTools UI at `/devtools` — open it in your phone's
 Chrome: Elements, Console, Network, HAR/DOM download.
+Inspection is HTTP-only (no WebSocket upgrade); the UI polls `/cdp`.
+
+> **Remote mode.** The daemon has no authentication. It binds loopback by
+> default and *refuses* non-loopback binds unless you pass `--allow-remote`
+> (or `"allow_remote": true`). Only expose it to a network you trust —
+> anyone who can reach it can browse, install plugins, and fetch internal URLs.
 
 **CLI.** `get`, `eval`, `tree`, `bench`, and a terminal DevTools REPL
 (`f1stmux devtools URL`).

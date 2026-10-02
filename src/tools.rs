@@ -23,6 +23,22 @@ fn get_sess(srv: &Arc<crate::rpc::Server>, p: &Value) -> Result<String, String> 
     Ok(id)
 }
 
+/// Lookup session đã tồn tại — KHÔNG tự tạo. Typo ID phải báo lỗi, không lặng
+/// lẽ trỏ sang session rỗng (trước đây get_sess tự tạo khiến session_close báo
+/// thành công giả và thao tác nhầm session).
+fn need_sess(srv: &Arc<crate::rpc::Server>, p: &Value) -> Result<String, String> {
+    let id = s(p, "session");
+    if id.is_empty() {
+        return get_sess(srv, p);
+    }
+    let m = srv.sessions.lock().unwrap();
+    if m.contains_key(&id) {
+        Ok(id)
+    } else {
+        Err(format!("session không tồn tại: `{id}` (dùng session_new để tạo)"))
+    }
+}
+
 pub async fn tool(srv: &Arc<crate::rpc::Server>, name: &str, p: &Value) -> Result<Value, String> {
     match name {
         // ---- điều phối ----
@@ -32,12 +48,12 @@ pub async fn tool(srv: &Arc<crate::rpc::Server>, name: &str, p: &Value) -> Resul
             Ok(json!(m.get(&id).map(|x| x.snapshot()).unwrap_or(Value::Null)))
         }
         "session_info" => {
-            let id = get_sess(srv, p)?;
+            let id = need_sess(srv, p)?;
             let m = srv.sessions.lock().unwrap();
             Ok(m.get(&id).map(|x| x.snapshot()).unwrap_or(Value::Null))
         }
         "session_close" => {
-            let id = get_sess(srv, p)?;
+            let id = need_sess(srv, p)?;
             let mut m = srv.sessions.lock().unwrap();
             Ok(json!({ "closed": m.remove(&id).is_some() }))
         }
@@ -50,7 +66,7 @@ pub async fn tool(srv: &Arc<crate::rpc::Server>, name: &str, p: &Value) -> Resul
 
         // ---- điều hướng ----
         "navigate" => {
-            let id = get_sess(srv, p)?;
+            let id = need_sess(srv, p)?;
             let url = s(p, "url");
             if url.is_empty() { return Err("thiếu `url`".into()); }
             let run_js = p.get("js").and_then(Value::as_bool).unwrap_or(true);
@@ -60,23 +76,24 @@ pub async fn tool(srv: &Arc<crate::rpc::Server>, name: &str, p: &Value) -> Resul
             };
             let mut m = srv.sessions.lock().unwrap();
             let sess = m.get_mut(&id).ok_or("session không tồn tại")?;
-            let r = crate::session::navigate(&url, &srv.cfg, sess, &wait, run_js).await?;
+            let cfg = srv.config();
+            let r = crate::session::navigate(&url, &cfg, sess, &wait, run_js).await?;
             Ok(serde_json::to_value(&r).unwrap_or(Value::Null))
         }
         "extract_text" => {
-            let id = get_sess(srv, p)?;
+            let id = need_sess(srv, p)?;
             let m = srv.sessions.lock().unwrap();
             let sess = m.get(&id).ok_or("session không tồn tại")?;
             Ok(json!({ "text": sess.dom.as_ref().map(|d| d.borrow().text_content(0)).unwrap_or_default() }))
         }
         "snapshot_dom" => {
-            let id = get_sess(srv, p)?;
+            let id = need_sess(srv, p)?;
             let m = srv.sessions.lock().unwrap();
             let sess = m.get(&id).ok_or("session không tồn tại")?;
             Ok(json!({ "html": sess.dom.as_ref().map(|d| d.borrow().inner_html(0)).unwrap_or_default() }))
         }
         "query" => {
-            let id = get_sess(srv, p)?;
+            let id = need_sess(srv, p)?;
             let sel = s(p, "selector");
             let m = srv.sessions.lock().unwrap();
             let sess = m.get(&id).ok_or("session không tồn tại")?;
@@ -95,7 +112,7 @@ pub async fn tool(srv: &Arc<crate::rpc::Server>, name: &str, p: &Value) -> Resul
             else { Ok(out.into_iter().next().map(|v| json!({"count": 1, "nodes": [v]})).unwrap_or(json!({"count":0,"nodes":[]}))) }
         }
         "eval_js" => {
-            let id = get_sess(srv, p)?;
+            let id = need_sess(srv, p)?;
             let src = s(p, "script");
             if src.is_empty() { return Err("thiếu `script`".into()); }
             let m = srv.sessions.lock().unwrap();
@@ -105,14 +122,25 @@ pub async fn tool(srv: &Arc<crate::rpc::Server>, name: &str, p: &Value) -> Resul
 
         // ---- mạng ----
         "network_log" => {
-            let id = get_sess(srv, p)?;
+            let id = need_sess(srv, p)?;
             let m = srv.sessions.lock().unwrap();
             let sess = m.get(&id).ok_or("session không tồn tại")?;
             Ok(json!({ "count": sess.net.len(), "entries": sess.net }))
         }
         "har_export" => {
+            // Mặc định xuất đúng session đang gọi — không trộn log các session khác.
+            // Truyền `"all": true` để xuất toàn bộ (admin/debug).
+            let only = s(p, "session");
+            let all = p.get("all").and_then(Value::as_bool).unwrap_or(false);
             let m = srv.sessions.lock().unwrap();
-            let es: Vec<_> = m.values().flat_map(|x| x.net.clone()).collect();
+            let es: Vec<_> = if all {
+                m.values().flat_map(|x| x.net.clone()).collect()
+            } else {
+                let id = if only.is_empty() {
+                    m.keys().next().cloned().unwrap_or_default()
+                } else { only };
+                m.get(&id).map(|x| x.net.clone()).unwrap_or_default()
+            };
             Ok(crate::inspector::to_har(&es))
         }
         "blocklist_test" => {
@@ -132,8 +160,16 @@ pub async fn tool(srv: &Arc<crate::rpc::Server>, name: &str, p: &Value) -> Resul
         // ---- stealth ----
         "stealth_profile" => {
             let name = s(p, "name");
-            if !name.is_empty() { return Ok(json!({ "active": name })); }
-            Ok(json!({ "active": srv.cfg.profile, "available": stealth::names() }))
+            if !name.is_empty() {
+                // Đặt thật: validate tên, đổi profile daemon dùng cho mọi navigation sau.
+                // (Trước đây chỉ báo tên mà không đổi gì — client tưởng đã đổi.)
+                if stealth::profile(&name).is_none() {
+                    return Err(format!("không có profile `{name}` (có: {})", stealth::names().join(", ")));
+                }
+                srv.cfg.lock().unwrap().profile = name.clone();
+                return Ok(json!({ "active": name }));
+            }
+            Ok(json!({ "active": srv.config().profile, "available": stealth::names() }))
         }
 
         // ---- plugin ----
@@ -250,4 +286,4 @@ pub fn mcp_tools() -> Value {
     Value::Array(tools)
 }
 
-pub fn cfg_of(srv: &Arc<crate::rpc::Server>) -> &Config { &srv.cfg }
+pub fn cfg_of(srv: &Arc<crate::rpc::Server>) -> Config { srv.config() }

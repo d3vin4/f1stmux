@@ -17,6 +17,9 @@ pub struct Config {
     pub kill_switch: bool,
     /// Cho phép session ghi cookie/storage xuống đĩa. Mặc định false.
     pub persist: bool,
+    /// Cho phép bind địa chỉ không phải loopback. Mặc định false: daemon không
+    /// auth nên bind remote mà không tường minh là tự mở cửa cho cả mạng.
+    pub allow_remote: bool,
 }
 
 impl Default for Config {
@@ -31,6 +34,7 @@ impl Default for Config {
             max_ram_mb: 512,
             kill_switch: false,
             persist: false,
+            allow_remote: false,
         }
     }
 }
@@ -38,14 +42,31 @@ impl Default for Config {
 impl Config {
     /// Đọc config, sau đó cho phép override từ config file.
     /// Không bao giờ tự ghi file — người dùng kiểm soát, không có phone-home.
+    /// File lỗi thì BÁO ra stderr chứ không lặng lẽ dùng default (trước đây lỗi
+    /// parse là rơi về default mà không ai biết — gồm cả lỗi bảo mật).
     pub fn load(path: Option<&std::path::Path>) -> Self {
         let mut cfg = Config::default();
-        if let Some(p) = path
-            && let Ok(s) = std::fs::read_to_string(p)
-            && let Ok(v) = serde_json::from_str::<Config>(&s)
-        {
-            cfg = v;
+        if let Some(p) = path {
+            match std::fs::read_to_string(p) {
+                Ok(s) => match serde_json::from_str::<Config>(&s) {
+                    Ok(v) => cfg = v,
+                    Err(e) => eprintln!("cảnh báo: config {} lỗi parse ({e}), dùng mặc định", p.display()),
+                },
+                Err(e) => eprintln!("cảnh báo: không đọc được config {} ({e}), dùng mặc định", p.display()),
+            }
         }
         cfg
+    }
+
+    /// true nếu listen trỏ ra ngoài loopback.
+    pub fn is_remote_bind(&self) -> bool {
+        let addr = self.listen.trim();
+        let host = if let Some(rest) = addr.strip_prefix('[') {
+            rest.split(']').next().unwrap_or(rest)
+        } else {
+            addr.rsplit(':').nth(1).unwrap_or(addr)
+        };
+        let host = host.to_ascii_lowercase();
+        !(host == "127.0.0.1" || host == "localhost" || host == "::1")
     }
 }
