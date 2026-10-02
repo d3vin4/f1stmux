@@ -65,6 +65,10 @@ enum Cmd {
     Mcp,
     /// Static security audit of a URL: headers, CSP/CORS, cookies, endpoint/CVE literals in the source.
     Audit { url: String },
+    /// PNG screenshot via Chromium CDP (layout thật).
+    Screenshot { url: String, #[arg(long, short = 'o')] out: String },
+    /// PDF via Chromium CDP (layout thật).
+    Pdf { url: String, #[arg(long, short = 'o')] out: String },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -160,6 +164,8 @@ async fn run(cfg: &Config, cmd: Cmd) -> Result<(), String> {
         Cmd::Devtools { url } => f1stmux::cli::devtools(cfg, &url).await,
         Cmd::Mcp => f1stmux::mcp::run(cfg.clone()).await,
         Cmd::Audit { url } => f1stmux::cli::audit(cfg, &url).await,
+        Cmd::Screenshot { url, out } => f1stmux::net::screenshot(cfg, &url, &out).await,
+        Cmd::Pdf { url, out } => f1stmux::net::pdf(cfg, &url, &out).await,
     }
 }
 
