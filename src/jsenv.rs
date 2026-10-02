@@ -183,26 +183,46 @@ impl Realm {
         })
     }
 
-    /// Chạy script. Lỗi được thu thập chứ không làm sập — trang hỏng vẫn đọc được phần còn lại.
+    /// Chạy script. Lỗi được thu thập kèm message+stack thật (qua String()),
+    /// không làm sập — trang hỏng vẫn đọc được phần còn lại.
     pub fn run(&self, src: &str, tag: &str) {
-        let r = self.ctx.with(|c| c.eval::<Value, _>(src).map(|_| ()));
-        if let Err(e) = r {
-            self.errors.borrow_mut().push(format!("{tag}: {e}"));
+        let r: rquickjs::Result<()> = self.ctx.with(|c| c.eval::<Value, _>(src).map(|_| ()));
+        if r.is_err() {
+            let msg = self.ctx.with(|c| {
+                let ex = c.catch();
+                if c.globals().set("__f1ex", ex).is_err() {
+                    return None;
+                }
+                c.eval::<String, _>("String((__f1ex && __f1ex.message ? __f1ex.message + '\\n' : '') + ((__f1ex && (__f1ex.stack || __f1ex.message)) || __f1ex))").ok()
+            });
+            match msg {
+                Some(m) => self.errors.borrow_mut().push(format!("{tag}: {m}")),
+                None => self.errors.borrow_mut().push(format!("{tag}: {r:?}")),
+            }
         }
     }
 
     /// Chạy script, trả về JSON. Script phải tự `JSON.stringify`.
+    /// Chạy expression, giữ nguyên kiểu JS (number/bool/array/object).
+    /// Throw → Err(message + stack), không nuốt thành null nữa.
     pub fn eval_json(&self, src: &str) -> Result<serde_json::Value, String> {
-        // `src` là expression (giống DevTools console). Chạy qua eval trong để
-        // cả expression lẫn statement đều chạy được; statement trả về Null.
+        // `src` là expression (giống DevTools console). try/catch bọc trong nên
+        // an toàn với expression; statement không giá trị trả về Null.
         let arg = serde_json::to_string(src).unwrap_or_default();
-        let wrapped = format!("JSON.stringify((function(__s){{ return (0, eval(__s)); }})({arg}))");
+        let wrapped = format!(
+            "JSON.stringify((function(__s){{ try {{ return {{ok:(0,eval(__s))}}; }} catch(e) {{ return {{err:String((e&&e.message?e.message+'\\n':'')+((e&&e.stack)||e))}}; }} }})({arg}))"
+        );
         let s: Result<String, _> = self.ctx.with(|c| c.eval(wrapped));
-        match s {
-            Ok(s) => serde_json::from_str(&s).map_err(|e| e.to_string()),
+        let s = match s {
+            Ok(s) => s,
             // JSON.stringify(undefined) → undefined, không phải string.
-            Err(_) => Ok(serde_json::Value::Null),
+            Err(_) => return Ok(serde_json::Value::Null),
+        };
+        let v: serde_json::Value = serde_json::from_str(&s).map_err(|e| e.to_string())?;
+        if let Some(msg) = v.get("err").and_then(|m| m.as_str()) {
+            return Err(msg.to_string());
         }
+        Ok(v.get("ok").cloned().unwrap_or(serde_json::Value::Null))
     }
 
     pub fn expired(&self) -> bool {

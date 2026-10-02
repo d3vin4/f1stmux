@@ -54,6 +54,8 @@ pub struct NavResult {
     /// F1stmux KHÔNG giải captcha — field này để AI biết mà đổi chiến thuật
     /// (đổi profile/proxy, thử lại sau, hoặc báo người dùng).
     pub captcha: Option<String>,
+    /// Chuỗi redirect đã đi qua (mỗi hop một URL). Debug shortener/shortlink chain.
+    pub redirects: Vec<String>,
 }
 
 #[derive(Default)]
@@ -173,12 +175,37 @@ pub async fn navigate(
     let mut timed_out = false;
 
     if run_js {
-        for s in &scripts {
+        for (i, s) in scripts.iter().enumerate() {
             if std::time::Instant::now() > realm.deadline {
                 timed_out = true;
                 break;
             }
-            realm.run(s, "page");
+            match s {
+                htmlparse::PageScript::Inline(code) => {
+                    realm.run(code, &format!("page:inline#{i}"));
+                }
+                htmlparse::PageScript::External(src) => {
+                    // Tải script ngoài rồi chạy theo đúng thứ tự. Lỗi tải được ghi
+                    // như lỗi page (có URL) thay vì làm hỏng cả navigation.
+                    let full = reqwest::Url::options()
+                        .base_url(reqwest::Url::parse(&f.final_url).ok().as_ref())
+                        .parse(src)
+                        .map(|u| u.to_string())
+                        .unwrap_or_default();
+                    if full.is_empty() || !(full.starts_with("http://") || full.starts_with("https://")) {
+                        errors.push(format!("page:{src}: URL script không hợp lệ"));
+                    } else {
+                        let ck = sess.cookies.header_for(&full);
+                        match crate::fetch::get(&full, cfg, prof, &ck).await {
+                            Ok(sf) => {
+                                sess.cookies.set_from_headers(&sf.final_url, &sf.headers);
+                                realm.run(&sf.body, &format!("page:{full}"));
+                            }
+                            Err(e) => errors.push(format!("page:{full}: {e}")),
+                        }
+                    }
+                }
+            }
             scripts_run += 1;
         }
     }
@@ -234,6 +261,7 @@ pub async fn navigate(
         timed_out,
         truncated: false,
         captcha,
+        redirects: f.redirects.clone(),
     };
 
     sess.dom = Some(dom.clone());

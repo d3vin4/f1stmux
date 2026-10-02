@@ -67,6 +67,8 @@ async fn dispatch(srv: &Arc<Server>, v: &Value) -> Value {
             }
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
             match crate::tools::tool(srv, name, &args).await {
+                // Chuỗi JSON đi thẳng ra text, không stringify thêm lần nữa.
+                Ok(Value::String(s)) => ok(json!({"content": [{"type": "text", "text": s}]})),
                 Ok(r) => ok(json!({"content": [{"type": "text", "text": r.to_string()}]})),
                 Err(e) => ok(json!({"content": [{"type": "text", "text": e}], "isError": true})),
             }

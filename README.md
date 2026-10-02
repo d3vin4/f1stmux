@@ -19,7 +19,7 @@ close it and every cookie, cache entry, and trace is gone.
 
 | Metric | Value |
 |---|---|
-| Binary (stripped release) | 4.1 MB |
+| Binary (stripped release) | 4.3 MB |
 | Daemon RSS after navigations | ~7 MB |
 | `GET example.com` | 200 in ~0.5–0.7 s |
 | Hacker News front page | 200, 4200+ chars, zero JS errors |

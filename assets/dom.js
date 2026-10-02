@@ -51,7 +51,10 @@
     getElementsByTagName(t) { return this.querySelectorAll(t.toUpperCase() === '*' ? '*' : t.toLowerCase()); }
     getElementsByClassName(c) { return this.querySelectorAll('.' + c); }
     getElementById(i) { return this.querySelector('#' + i); }
-    matches(sel) { return H.query(sel, this.__id).includes(this.__id); }
+    get elements() { return this.querySelectorAll('input,select,textarea,button'); }
+    get value() { const v = this.getAttribute('value'); return v === undefined ? '' : v; }
+    set value(v) { this.setAttribute('value', String(v)); }
+    matches(sel) { const p = H.parent(this.__id); return H.query(sel, p < 0 ? 0 : p).includes(this.__id); }
     closest(sel) {
       let n = this;
       while (n) { if (n.matches(sel)) return n; n = n.parentNode; }
@@ -98,11 +101,23 @@
     getElementById: (i) => { const r = H.query('#' + i, 0); return r.length ? wrap(r[0]) : null; },
     getElementsByTagName: (t) => H.query(t === '*' ? '*' : String(t).toLowerCase(), 0).map(wrap),
     getElementsByClassName: (c) => H.query('.' + c, 0).map(wrap),
+    get forms() { return H.query('form', 0).map(wrap); },
+    get images() { return H.query('img', 0).map(wrap); },
+    get links() { return H.query('a[href]', 0).map(wrap); },
+    get scripts() { return H.query('script', 0).map(wrap); },
     addEventListener: () => {},
     removeEventListener: () => {},
   };
 
-  // navigator: phải khớp profile, nếu không sẽ tự tố giả.
+  // console: gần như mọi trang đều gọi. Nối vào H.log để tool đọc được.
+  const fmt = (a) => a.map((x) => { try { return typeof x === 'string' ? x : JSON.stringify(x); } catch (e) { return String(x); } }).join(' ');
+  globalThis.console = {
+    log: (...a) => H.log('log', fmt(a)),
+    info: (...a) => H.log('info', fmt(a)),
+    warn: (...a) => H.log('warn', fmt(a)),
+    error: (...a) => H.log('error', fmt(a)),
+    debug: (...a) => H.log('debug', fmt(a)),
+  };
   const navigator = {
     userAgent: H.ua(),
     platform: H.platform(),
@@ -122,7 +137,9 @@
   Object.defineProperty(globalThis, '__f1tz', { value: H.timezone() });
 
   const screen = { width: H.screenW(), height: H.screenH(), availWidth: H.screenW(), availHeight: H.screenH(), colorDepth: 24, pixelDepth: 24 };
-  const window = globalThis;
+  globalThis.window = globalThis;
+  globalThis.self = globalThis;
+  globalThis.globalThis = globalThis;
 
   globalThis.document = document;
   globalThis.navigator = navigator;

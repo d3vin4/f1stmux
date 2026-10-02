@@ -204,17 +204,15 @@ impl Dom {
         }
         if !tag.is_empty() && n.name != tag { return false; }
         if !id_sel.is_empty() {
-            let want = &id_sel[1..];
             match n.attrs.iter().find(|(k, _)| k == "id") {
-                Some((_, v)) if v == want => {}
+                Some((_, v)) if v == id_sel => {}
                 _ => return false,
             }
         }
         if !classes.is_empty() {
             let have = n.attrs.iter().find(|(k, _)| k == "class").map(|(_, v)| v.as_str()).unwrap_or("");
             let list: Vec<&str> = have.split_whitespace().collect();
-            for c in classes {
-                let want = &c[1..];
+            for want in classes {
                 if !list.contains(&want) { return false; }
             }
         }

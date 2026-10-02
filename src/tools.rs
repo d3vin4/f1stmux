@@ -168,6 +168,13 @@ pub async fn tool(srv: &Arc<crate::rpc::Server>, name: &str, p: &Value) -> Resul
         // ---- bench ----
         "bench" => Ok(json!({ "note": "dùng CLI: f1stmux bench --compare <path>" })),
 
+        "version" => Ok(json!({
+            "name": "f1stmux",
+            "version": env!("CARGO_PKG_VERSION"),
+            "protocol": "2024-11-05",
+            "api": crate::plugin::CURRENT_API_VERSION,
+        })),
+
         _ => Err(format!("tool chưa có: {name}")),
     }
 }
@@ -191,7 +198,8 @@ pub fn catalog() -> Value {
         {"name":"plugin_list","desc":"Liệt kê plugin đã cài"},
         {"name":"plugin_install","desc":"Cài plugin từ thư mục"},
         {"name":"plugin_info","desc":"Chi tiết một plugin"},
-        {"name":"bench","desc":"Đo hiệu năng"}
+        {"name":"bench","desc":"Đo hiệu năng"},
+        {"name":"version","desc":"Phiên bản f1stmux + protocol"}
     ])
 }
 
@@ -230,6 +238,7 @@ pub fn mcp_tools() -> Value {
         ("plugin_install", "Cài plugin từ thư mục", vec![("path", str_prop("Đường dẫn thư mục plugin"))], vec!["path"]),
         ("plugin_info", "Chi tiết một plugin", vec![("id", str_prop("ID plugin"))], vec!["id"]),
         ("bench", "Ghi chú: dùng CLI `f1stmux bench`", vec![], vec![]),
+        ("version", "Phiên bản f1stmux + protocol", vec![], vec![]),
     ];
     let tools: Vec<Value> = defs.into_iter().map(|(name, desc, props, req)| {
         let mut map = serde_json::Map::new();
