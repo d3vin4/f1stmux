@@ -58,6 +58,9 @@ pub struct NavResult {
     pub redirects: Vec<String>,
     /// Human-solve ticket when navigating with on_challenge=portal and hitting a challenge.
     pub challenge: Option<crate::challenge::ChallengeRef>,
+    /// Hidden token fields extracted from the page (captcha forms expose them in the DOM).
+    /// Generic extraction — no per-site logic, just DOM truth. Sent back with each captcha.
+    pub captcha_tokens: Vec<(String, String)>,
 }
 
 #[derive(Default)]
@@ -292,6 +295,7 @@ pub async fn navigate(
         captcha,
         redirects: f.redirects.clone(),
         challenge: None,
+        captcha_tokens: crate::challenge::extract_hidden_tokens(&dom.borrow()),
     };
 
     sess.dom = Some(dom.clone());

@@ -65,9 +65,9 @@ enum Cmd {
     Mcp,
     /// Static security audit of a URL: headers, CSP/CORS, cookies, endpoint/CVE literals in the source.
     Audit { url: String },
-    /// PNG screenshot via Chromium CDP (layout thật).
+    /// PNG screenshot via Chromium CDP (real layout).
     Screenshot { url: String, #[arg(long, short = 'o')] out: String },
-    /// PDF via Chromium CDP (layout thật).
+    /// PDF via Chromium CDP (real layout).
     Pdf { url: String, #[arg(long, short = 'o')] out: String },
 }
 

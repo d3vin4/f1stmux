@@ -90,8 +90,9 @@ pub async fn tool(srv: &Arc<crate::rpc::Server>, name: &str, p: &Value) -> Resul
                     && let Some(spec) = crate::challenge::auto_extract(&dom.borrow(), &r.final_url)
                 {
                     let listen = srv.config().listen;
+                    let ctx = crate::challenge::extract_hidden_tokens(&dom.borrow());
                     r.challenge = Some(crate::challenge::create_ticket(
-                        &srv.challenges, &listen, &id, &r.final_url, &kind, spec,
+                        &srv.challenges, &listen, &id, &r.final_url, &kind, spec, ctx,
                     ));
                 }
             }
@@ -241,7 +242,8 @@ pub async fn tool(srv: &Arc<crate::rpc::Server>, name: &str, p: &Value) -> Resul
             };
             drop(m);
             let listen = srv.config().listen;
-            let t = crate::challenge::create_ticket(&srv.challenges, &listen, &sid, &page_url, &kind, spec);
+            let ctx = crate::challenge::extract_hidden_tokens(&dom.borrow());
+            let t = crate::challenge::create_ticket(&srv.challenges, &listen, &sid, &page_url, &kind, spec, ctx);
             Ok(json!({"id": t.id, "portal_url": t.portal_url, "kind": t.kind}))
         }
         "challenge_result" => {

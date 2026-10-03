@@ -376,7 +376,7 @@ dependencies = [
 
 [[package]]
 name = "f1stchrome"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "base64 0.22.1",
  "rand",
@@ -390,7 +390,7 @@ dependencies = [
 
 [[package]]
 name = "f1stmux"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "base64 0.22.1",
  "clap",

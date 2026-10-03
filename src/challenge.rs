@@ -99,6 +99,71 @@ pub fn auto_extract(dom: &Dom, page_url: &str) -> Option<ReplaySpec> {
     Some(ReplaySpec { post_url, fields, token_field: token_field.into() })
 }
 
+/// Extract every named form field on the page so a human solver sees the full
+/// form state alongside each captcha: (field name, current value) for all
+/// inputs and textareas, plus any challenge sitekeys. Generic DOM truth,
+/// no per-site logic. Capped so one page cannot flood the agent context.
+pub fn extract_hidden_tokens(dom: &Dom) -> Vec<(String, String)> {
+    const CAP: usize = 64;
+    let mut out = Vec::new();
+    // Sitekeys first — the human needs to know *which* challenge to solve.
+    if let Ok(nodes) = dom.query("[data-sitekey]", 0) {
+        for id in nodes {
+            if let Some(n) = dom.get(id as usize)
+                && let Some((_, v)) = n.attrs.iter().find(|(k, _)| k == "data-sitekey")
+                && !v.is_empty()
+                && !out.iter().any(|(_, x)| x == v)
+            {
+                out.push(("data-sitekey".to_string(), v.clone()));
+            }
+            if out.len() >= CAP {
+                return out;
+            }
+        }
+    }
+    // Every named input, in document order (skip action-only button types).
+    if let Ok(inputs) = dom.query("input", 0) {
+        for id in inputs {
+            if let Some(n) = dom.get(id as usize) {
+                let g = |k: &str| {
+                    n.attrs.iter().find(|(a, _)| *a == k).map(|(_, v)| v.clone()).unwrap_or_default()
+                };
+                let (name, typ, val) = (g("name"), g("type"), g("value"));
+                if name.is_empty() || out.iter().any(|(n, _)| n == &name) {
+                    continue;
+                }
+                if matches!(
+                    typ.to_ascii_lowercase().as_str(),
+                    "submit" | "button" | "reset" | "image" | "file"
+                ) {
+                    continue;
+                }
+                out.push((name, val));
+            }
+            if out.len() >= CAP {
+                return out;
+            }
+        }
+    }
+    // Named textareas carry their text content, not a value attribute.
+    if let Ok(areas) = dom.query("textarea", 0) {
+        for id in areas {
+            if let Some(n) = dom.get(id as usize) {
+                if let Some((_, name)) = n.attrs.iter().find(|(k, _)| k == "name").cloned()
+                    && !name.is_empty()
+                    && !out.iter().any(|(x, _)| x == &name)
+                {
+                    out.push((name, dom.text_content(id as usize)));
+                }
+            }
+            if out.len() >= CAP {
+                return out;
+            }
+        }
+    }
+    out
+}
+
 fn resolve(base: &str, rel: &str) -> Option<String> {
     if rel.is_empty() {
         return None;
@@ -125,6 +190,9 @@ pub struct Ticket {
     pub page_url: String,
     pub kind: String,
     pub spec: ReplaySpec,
+    /// Full extracted form state (all named fields + sitekeys) shown to the
+    /// human solver alongside the captcha. Generic DOM truth, capped at 64.
+    pub context: Vec<(String, String)>,
     pub status: TicketStatus,
     pub url: Option<String>,
     pub note: String,
@@ -160,6 +228,7 @@ pub fn create_ticket(
     page_url: &str,
     kind: &str,
     spec: ReplaySpec,
+    context: Vec<(String, String)>,
 ) -> ChallengeRef {
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let id = format!("ch-{n}");
@@ -171,6 +240,7 @@ pub fn create_ticket(
             page_url: page_url.into(),
             kind: kind.into(),
             spec,
+            context,
             status: TicketStatus::Held,
             url: None,
             note: String::new(),
@@ -298,6 +368,16 @@ fn esc(s: &str) -> String {
 /// No site name is hardcoded — everything comes from the ticket.
 pub fn portal_page(t: &Ticket, ttl_left_s: u64) -> String {
     let host = t.page_url.split('/').nth(2).unwrap_or(&t.page_url);
+    let mut rows = String::new();
+    for (k, v) in &t.context {
+        let vv = if v.len() > 120 { format!("{}…", &v[..120]) } else { v.clone() };
+        rows.push_str(&format!("<tr><td><code>{}</code></td><td>{}</td></tr>", esc(k), esc(&vv)));
+    }
+    let ctx_block = if rows.is_empty() {
+        String::new()
+    } else {
+        format!("<h3>Extracted form state</h3><table><tr><th>field</th><th>value</th></tr>{rows}</table>")
+    };
     format!(
         r#"<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -312,6 +392,7 @@ pub fn portal_page(t: &Ticket, ttl_left_s: u64) -> String {
 <code>javascript:prompt('token',(typeof grecaptcha!=='undefined'&&grecaptcha.getResponse())||(typeof hcaptcha!=='undefined'&&hcaptcha.getResponse())||'')</code></li>
 <li>Paste the token below and submit. The agent never opens the destination itself.</li>
 </ol>
+{ctx}
 <form method="post" action="/challenge/{id}/solution">
 <input name="token" placeholder="paste token" autocomplete="off">
 <button type="submit">Submit</button>
@@ -322,5 +403,6 @@ pub fn portal_page(t: &Ticket, ttl_left_s: u64) -> String {
         kind = esc(&t.kind),
         ttl = ttl_left_s,
         url = esc(&t.page_url),
+        ctx = ctx_block,
     )
 }

@@ -132,7 +132,7 @@ async fn challenge_create_http(srv: &Arc<Server>, body: &str) -> (&'static str, 
     };
     drop(m);
     let listen = srv.config().listen;
-    let t = crate::challenge::create_ticket(&srv.challenges, &listen, sid, &page_url, &kind, spec);
+    let t = crate::challenge::create_ticket(&srv.challenges, &listen, sid, &page_url, &kind, spec, crate::challenge::extract_hidden_tokens(&dom.borrow()));
     json(json!({"id": t.id, "portal_url": t.portal_url, "kind": t.kind}))
 }
 

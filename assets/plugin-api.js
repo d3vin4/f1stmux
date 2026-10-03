@@ -1,19 +1,20 @@
-// Lớp vờ API cho plugin, phía JS.
+// JS-side API shim for plugins.
 //
-// Rust cài `__plugin` trước rồi mới chạy file này. `__plugin` là nơi DUY NHẤT quyền
-// được kiểm tra — nếu plugin đi đường khác (đụng `__f1host` trực tiếp) thì host không
-// kiểm được, nên lớp vờ này không bao giờ chạm vào `__f1host`.
+// Rust installs `__plugin` before running this file. `__plugin` is the ONLY
+// place permissions are checked — if a plugin goes around it (touching
+// `__f1host` directly) the host cannot check, so this shim never touches
+// `__f1host`.
 //
-// Cấu trúc file plugin:
-//     plugin.log('xin chào');
+// Plugin file structure:
+//     plugin.log('hello');
 //     plugin.on('onDOMReady', (ctx) => { plugin.dom.query('h1'); });
-//     module.exports = { onDOMReady() {} };   // hoặc gán thẳng vào plugin.exports
+//     module.exports = { onDOMReady() {} };   // or assign to plugin.exports directly
 (function () {
   'use strict';
 
   var B = globalThis.__plugin;
-  if (!B) throw new Error('f1stmux: thiếu bridge __plugin — lỗi host');
-  if (globalThis.plugin) return; // đã cài rồi (nạp lại cùng realm)
+  if (!B) throw new Error('f1stmux: missing __plugin bridge — host bug');
+  if (globalThis.plugin) return; // already installed (same-realm reload)
 
   var HOOKS = [
     'onRequest', 'onResponse', 'onDOMReady', 'onToolCall', 'onPageScript',
@@ -23,12 +24,12 @@
   var state = { hooks: {} };
   globalThis.__pluginState = state;
 
-  // Quyền thiếu thì ném lỗi ngay tại chỗ gọi: plugin tự thấy mình không có quyền
-  // thay vì âm thầm nhận kết quả rỗng rồi tưởng là bug của trang.
+  // Missing permission throws right at the call site: the plugin sees its own
+  // lack of permission instead of silently getting empty results and blaming the page.
   function need(perm, what) {
     if (!B.permitted(perm)) {
-      throw new Error('f1stmux: thiếu quyền ' + perm + ' cho ' + what +
-        ' (đã ghi vi phạm — host sẽ báo)');
+      throw new Error('f1stmux: missing permission ' + perm + ' for ' + what +
+        ' (violation recorded — the host will report it)');
     }
   }
 
@@ -37,26 +38,26 @@
     api: B.api,
     hostApi: B.hostApi,
     hooks: HOOKS,
-    // Mảng quyền đang có — tiện cho `plugin.log(JSON.stringify(plugin.perms))`.
+    // Current permission list — handy for `plugin.log(JSON.stringify(plugin.perms))`.
     perms: B.permissions(),
 
-    // Hook và export của plugin. Không cần biết trước tên: `plugin.on` ghi vào đây.
+    // Plugin hooks and exports. No need to know names upfront: `plugin.on` records here.
     exports: {},
 
-    // Đăng ký tool cho agent. `schema` là JSON Schema — host giữ nguyên, không validate.
+    // Register a tool for the agent. `schema` is JSON Schema — the host keeps it as-is, no validation.
     tool: function (name, schema) {
       need('tool.register', 'plugin.tool()');
       B.tool(String(name), JSON.stringify(schema || {}));
       return plugin;
     },
 
-    // Đăng ký handler cho một hook. Handler nhận payload của host (xem doc của hook).
+    // Register a handler for a hook. The handler receives the host payload (see the hook docs).
     on: function (hook, fn) {
       if (HOOKS.indexOf(hook) < 0) {
-        throw new Error('f1stmux: hook lạ "' + hook + '"; có: ' + HOOKS.join(', '));
+        throw new Error('f1stmux: unknown hook "' + hook + '"; have: ' + HOOKS.join(', '));
       }
       if (typeof fn !== 'function') {
-        throw new Error('f1stmux: handler của ' + hook + ' phải là hàm');
+        throw new Error('f1stmux: handler for ' + hook + ' must be a function');
       }
       state.hooks[hook] = fn;
       return plugin;
@@ -74,7 +75,7 @@
     },
 
     dom: {
-      // Trả về mảng id node. `plugin.dom.wrap(id)` để lấy text/html gọn.
+      // Returns an array of node ids. `plugin.dom.wrap(id)` for compact text/html.
       query: function (sel) {
         need('dom.read', 'plugin.dom.query()');
         return B.domQuery(String(sel));
@@ -94,7 +95,7 @@
     },
 
     request: {
-      // Chặn một URL. `false` = không có quyền hoặc host từ chối.
+      // Block a URL. `false` = no permission or host refused.
       block: function (url) {
         need('net.intercept', 'plugin.request.block()');
         return B.block(String(url));
@@ -104,11 +105,11 @@
 
   function num(v) {
     var n = Number(v);
-    if (!isFinite(n) || n < 0) throw new Error('f1stmux: id node không hợp lệ: ' + v);
+    if (!isFinite(n) || n < 0) throw new Error('f1stmux: invalid node id: ' + v);
     return Math.floor(n);
   }
 
-  // Log object mà không ném lỗi vì circular — log là đường gỡ lỗi, không phải chỗ để crash.
+  // Log objects without throwing on circular refs — logging is a debug path, not a place to crash.
   function safeJson(v) {
     try {
       return JSON.stringify(v);
@@ -118,7 +119,7 @@
   }
 
   globalThis.plugin = plugin;
-  // Cho plugin viết kiểu CommonJS quen thuộc. Host sẽ gộp `module.exports` vào
-  // `plugin.exports` sau khi entry chạy xong, nên cả hai cách viết đều được.
+  // Lets plugins use the familiar CommonJS style. The host merges `module.exports`
+  // into `plugin.exports` after the entry finishes, so both styles work.
   globalThis.module = { exports: plugin.exports };
 })();

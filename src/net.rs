@@ -49,7 +49,7 @@ pub async fn screenshot(_cfg: &Config, url: &str, out: &str) -> Result<(), Strin
         }
         Err(e) => {
             // Fast fallback: rasterized DOM snapshot (text layout, no external Chromium needed).
-            eprintln!("chú ý: {e}. Produced DOM-raster screenshot from the fast engine.");
+            eprintln!("note: {e}. Produced DOM-raster screenshot from the fast engine.");
             let sess_html = fetch_html_for_render(url).await?;
             let png = dom_to_png(&sess_html, 1024, 768);
             std::fs::write(out, &png).map_err(|e| e.to_string())?;

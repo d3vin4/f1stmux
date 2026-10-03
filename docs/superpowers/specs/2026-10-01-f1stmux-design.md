@@ -1,164 +1,167 @@
-# F1stmux — Headless Browser cho AI, thiết kế Termux
+# F1stmux — Headless Browser for AI, a Termux-targeted design
 
-Ngày: 2026-10-01 · Trạng thái: **draft, chờ review** · Đối chiếu: Lightpanda
+> Translated from the original Vietnamese spec; the design intent is unchanged.
 
-## 0. Phase 0 — kết quả đo thật trên máy đích
+Date: 2026-10-01 · Status: **draft, awaiting review** · Compared against: Lightpanda
 
-Đã build và chạy trên chính máy này (`aarch64-linux-android`, rustc 1.98.1, LLVM 21.1.8). Đây là số thật, không phải ước lượng.
+## 0. Phase 0 — real measurements on the target machine
 
-| Hạng mục | Kết quả |
+Built and run on this very machine (`aarch64-linux-android`, rustc 1.98.1, LLVM 21.1.8). These are real numbers, not estimates.
+
+| Item | Result |
 |---|---|
-| `libclang` | ✅ Có sẵn ở `$PREFIX/lib/libclang.so` → `rquickjs` build được |
-| `rquickjs` 0.14.0 + feature `bindgen` | ✅ Build thành công. QuickJS eval `Promise`/`Proxy`/`Symbol`/`BigInt` đều hoạt động |
-| `html5ever` qua `scraper` 0.27 | ✅ Build + parse, `h1` trả về đúng text |
-| `rustls` 0.23.45 + `ring` 0.17.14 | ✅ Build được trên Android (không cần NDK) |
-| HTTP thật | ✅ `GET https://example.com` → 200, 713 bytes, nội dung đúng, 497 ms |
+| `libclang` | ✅ Already present at `$PREFIX/lib/libclang.so` → `rquickjs` can be built |
+| `rquickjs` 0.14.0 + feature `bindgen` | ✅ Builds successfully. QuickJS eval of `Promise`/`Proxy`/`Symbol`/`BigInt` all work |
+| `html5ever` via `scraper` 0.27 | ✅ Builds + parses; `h1` returns the correct text |
+| `rustls` 0.23.45 + `ring` 0.17.14 | ✅ Builds on Android (no NDK needed) |
+| Real HTTP | ✅ `GET https://example.com` → 200, 713 bytes, correct content, 497 ms |
 | HTTP/2 | ✅ `POST https://nghttp2.org/httpbin/post` → 200 |
-| SOCKS5 | ✅ Client chấp nhận cấu hình `socks5://` |
-| RSS đo được | **6.7 MB** với HTTP stack + roots + 1 realm QuickJS |
-| Binary (spike) | 3.3 MB, chưa `strip` |
+| SOCKS5 | ✅ The client accepts a `socks5://` configuration |
+| Measured RSS | **6.7 MB** with the HTTP stack + roots + 1 QuickJS realm |
+| Binary (spike) | 3.3 MB, not yet `strip`ped |
 
-### 0.1 Ba cái bẫy phải ghi vào thiết kế
+### 0.1 Three traps that must be written into the design
 
-Ba lỗi này đều làm build hoặc chạy hỏng, và đều không đoán trước được:
+Each of these three issues breaks either the build or the runtime, and none of them can be anticipated:
 
-1. **`rustls` mặc định PANIC trên Android.** `rustls-platform-verifier` cần JNI init: `Expect rustls-platform-verifier to be initialized`. Giải pháp: **không dùng system CA store**, dựng `RootCertStore` từ `webpki-roots` (121 root) và `install_default()` thủ công cho `ring`. Với browser riêng tư, cách này **đúng cả về mặt triết lý** — không đọc kho CA của hệ điều hành là một dấu vết.
+1. **`rustls` PANICs by default on Android.** `rustls-platform-verifier` requires JNI init: `Expect rustls-platform-verifier to be initialized`. Fix: **do not use the system CA store**; build a `RootCertStore` from `webpki-roots` (121 roots) and call `install_default()` manually for `ring`. For a privacy-focused browser this is **also philosophically correct** — not reading the OS certificate authority store is itself a fingerprint.
 
-2. **`aws-lc-rs` cũng có mặt trong cây phụ thuộc.** Nó build được, nhưng kéo theo assembler/C mà ta không dùng. Cấu hình: `rustls` với `default-features = false` + feature `ring`, cài provider bằng tay. Đây là cấu hình bắt buộc trong `Cargo.toml`.
+2. **`aws-lc-rs` is also present in the dependency tree.** It builds, but it drags along assembler/C code that we never use. Configuration: `rustls` with `default-features = false` + the `ring` feature, installing the provider by hand. This configuration is mandatory in `Cargo.toml`.
 
-3. **Tên feature của `reqwest` 0.13 đã đổi.** `rustls-tls` không còn tồn tại (tên là `rustls`); muốn tự loại provider thì dùng `rustls-no-provider` và cấu hình TLS thủ công. Ghi vào spec để không ai phải mất 30 phút tìm lại.
+3. **The feature names of `reqwest` 0.13 have changed.** `rustls-tls` no longer exists (it is now called `rustls`); to exclude the provider yourself, use `rustls-no-provider` and configure TLS manually. Recorded in the spec so nobody has to spend 30 minutes rediscovering it.
 
-### 0.2 Điều này không nói
+### 0.2 What this does not say
 
-Số 6.7 MB là RSS của một spike chỉ có HTTP + 1 realm. Daemon thật còn DOM, a11y, plugin host, scheduler. **Mục tiêu idle ≤ 30 MB vẫn là mục tiêu, chưa phải số đo** — Phase 1 sẽ đo lại khi có phần lõi.
+The 6.7 MB figure is the RSS of a spike that has only HTTP + 1 realm. The real daemon also has DOM, a11y, a plugin host, and a scheduler. **The idle ≤ 30 MB target is still only a target, not a measurement** — Phase 1 will measure again once the core exists.
 
 ---
 
-## 1. Mục tiêu và ràng buộc
+## 1. Goals and constraints
 
-F1stmux là headless browser chạy **chỉ trong terminal**, tối ưu cho **Termux trên Android aarch64**, dành cho AI điều khiển.
+F1stmux is a headless browser that runs **only inside a terminal**, optimized for **Termux on aarch64 Android**, built for AI control.
 
-**Ràng buộc cứng của môi trường đích** (đo trên máy build):
+**Hard constraints of the target environment** (measured on the build machine):
 
-| Hạng mục | Giá trị | Hệ quả thiết kế |
+| Item | Value | Design consequence |
 |---|---|---|
-| RAM tổng | 3.6 GB (2.8 GB đã dùng) | Mục tiêu daemon idle < 30 MB. Chromium không khả thi. |
-| CPU | 8 core aarch64 | Hướng đơn luồng + async, tránh process-per-tab |
-| Toolchain | `cargo 1.98`, `node 26`, `python 3.14`, không có Go | Rust là ngôn ngữ chính. Go plugin phải tự cài. |
-| Network | Android, không root | DoH bắt buộc để chống DNS leak. |
+| Total RAM | 3.6 GB (2.8 GB already in use) | Daemon idle target < 30 MB. Chromium is not viable. |
+| CPU | 8 aarch64 cores | Single-threaded direction + async; avoid process-per-tab |
+| Toolchain | `cargo 1.98`, `node 26`, `python 3.14`, no Go | Rust is the primary language. Go plugins must be installed separately. |
+| Network | Android, no root | DoH is mandatory to prevent DNS leaks. |
 
-**Chỉ số thành công** (đo bằng `f1stmux bench`):
+**Success criteria** (measured with `f1stmux bench`):
 
-- RAM idle daemon ≤ 30 MB; mỗi tab JS ≤ 12 MB
+- Idle daemon RAM ≤ 30 MB; JS per tab ≤ 12 MB
 - Cold start < 100 ms
-- Navigate+extract, HTML tĩnh: < 300 ms
-- Navigate+extract, SPA có JS: < 2 s (chấp nhận hạn chế, xem §7)
-- Binary ≤ 15 MB (sau `strip`)
-- Không một byte nào ra ngoài ngoài các request do người dùng ra lệnh
+- Navigate+extract, static HTML: < 300 ms
+- Navigate+extract, SPA with JS: < 2 s (accepted limitation, see §7)
+- Binary ≤ 15 MB (after `strip`)
+- Not one byte goes out except through requests the user explicitly commands
 
-## 2. Quyết định kiến trúc
+## 2. Architecture decisions
 
-### 2.1 Ngôn ngữ: Rust cho toàn bộ core, C/C++ chỉ khi có bằng chứng
+### 2.1 Language: Rust for the entire core, C/C++ only with evidence
 
-Bạn chọn "C++ + Rust" và "nhanh mạnh tốt nhất nhất". Sau khi cân, kết luận là **Rust cho 100% core**:
+You originally chose "C++ + Rust" and "as fast as possible at everything". After weighing it, the conclusion is **Rust for 100% of the core**:
 
-- **QuickJS là C, không phải C++.** Nên "C++" thực tế chỉ là tầng FFI tới QuickJS — không phải một ngôn ngữ thứ hai để bảo trì.
-- Thêm C++ chỉ để cạnh tranh với Rust trong cùng một việc là tự tạo rào cản build trên nền tảng mà ta còn chưa chắc build được.
-- Đường nâng cấp C/C++ vẫn mở: nếu `bench` cho thấy hot path nào (HTML tokenize, buffer xử lý) bị bottleneck, viết một `.cpp` đó, gọi qua `cc` crate, đo lại. **Có bằng chứng mới thêm, không đoán trước.**
+- **QuickJS is C, not C++.** So "C++" is in practice only an FFI layer down to QuickJS — not a second language to maintain.
+- Adding C++ only to compete with Rust on the same work means creating a build obstacle on a platform we are not even sure can build yet.
+- The C/C++ upgrade path stays open: if `bench` shows that some hot path (HTML tokenize, buffer handling) is a bottleneck, write that one `.cpp`, call it through the `cc` crate, and measure again. **Add only with evidence, never on speculation.**
 
-Rủi ro của quyết định này: nếu Rust thua ở một hot path, ta phải làm thêm một vòng tối ưu. Chấp nhận, vì vòng đó nhỏ và có đo đạc.
+The risk of this decision: if Rust loses on some hot path, we have to run one more optimization round. Accepted, because that round is small and measurable.
 
-### 2.2 Không có layout engine — đây là quyết định giới hạn, không phải sự lười
+### 2.2 No layout engine — this is a limiting decision, not laziness
 
-Ta **không** dựng pixel. Không có box layout, không rasterize, không screenshot ảnh thật.
+We **do not** lay out pixels. No box layout, no rasterization, no real-image screenshots.
 
-Cái ta *có*:
+What we *do* have:
 
-- DOM tree đầy đủ từ HTML5 parser
-- Accessibility tree tự dựng (role/name/value)
-- `text` trích từ DOM
-- Network log đầy đủ, HAR export
+- A full DOM tree from an HTML5 parser
+- A self-built accessibility tree (role/name/value)
+- `text` extracted from the DOM
+- A complete network log, HAR export
 - Header order, TLS fingerprint, JS environment
 
-**Hệ quả trung thực:** nội dung mà chỉ hiện sau khi layout tính toán (lazy-mount theo viewport, virtual list, `content-visibility`) sẽ không xuất hiện. Ta không giả vờ không có giới hạn này.
+**The honest consequence:** content that only appears after layout is computed (viewport-based lazy mounting, virtual lists, `content-visibility`) will not show up. We do not pretend this limitation does not exist.
 
-### 2.3 Chống phát hiện: mức đầy đủ, theo 4 lớp
+### 2.3 Anti-detection: full coverage, in 4 layers
 
-Mỗi lớp chống một loại tín hiệu khác nhau. Bỏ lớp nào là mất lớp đó.
+Each layer defends against a different kind of signal. Dropping any layer means losing that layer.
 
-| Lớp | Chống gì | Cơ chế |
+| Layer | What it defends against | Mechanism |
 |---|---|---|
-| **1. Profile danh tính** | Header/UA/Client-Hints không khớp nhau | Bộ profile đóng bóng: `chrome`, `edge`, `brave`, `firefox`, `safari`. Mỗi profile gắn UA + header order + client hints + viewport + timezone + locale + platform, **nhất quán nội bộ**. Tín hiện tệ nhất là profile lộ chỗ trống. |
-| **2. TLS** | JA3/JA4 lệch so với browser thật | TLS stack cấu hình được ClientHello: cipher order, extension order (sinh JA4), ALPN, key share, GREASE, signature algos. `--profile` điều khiển, không phải ngẫu nhiên. |
-| **3. JS environment** | Canvas/WebGL/Audio/熵 bất thường | Noise *có kiểm soát* trong QuickJS: canvas hash ổn định trong 1 session, khác giữa 2 session. `navigator.hardwareConcurrency`, `deviceMemory`, timezone, platform, `screen` khớp profile. |
-| **4. Leak** | DNS leak, WebRTC leak, IP leak | DoH bắt buộc (không có đường tắt), chặn WebRTC peer API, mọi traffic bắt buộc qua proxy/SOCKS5/Tor, chặn request ngoài allowlist. Kill switch tắt tất cả hook khi nghi vấn. |
+| **1. Identity profile** | Mismatched header/UA/Client-Hints | A shadow profile set: `chrome`, `edge`, `brave`, `firefox`, `safari`. Each profile binds a UA + header order + client hints + viewport + timezone + locale + platform, **internally consistent**. The worst signal is a profile that exposes a gap. |
+| **2. TLS** | JA3/JA4 that deviate from a real browser | A TLS stack that can configure the ClientHello: cipher order, extension order (which generates JA4), ALPN, key share, GREASE, signature algos. Driven by `--profile`, not random. |
+| **3. JS environment** | Anomalous canvas/WebGL/Audio/entropy | *Controlled* noise inside QuickJS: the canvas hash is stable within one session and differs across two sessions. `navigator.hardwareConcurrency`, `deviceMemory`, timezone, platform, `screen` all match the profile. |
+| **4. Leaks** | DNS leaks, WebRTC leaks, IP leaks | DoH is mandatory (there is no opt-out), WebRTC peer APIs are blocked, all traffic must go through proxy/SOCKS5/Tor, and requests outside the allowlist are blocked. The kill switch disables every hook when something looks suspicious. |
 
-**Quy tắc bất di bất dịch của lớp 3:** fingerprint phải **ổn định trong suốt session** và **thay đổi giữa các session**. Nhiễu mỗi lần gọi `canvas.toDataURL()` sẽ tệ hơn là không nhiễu — đó là dấu vết của bot.
+**The inviolable rule of layer 3:** the fingerprint must be **stable for the whole session** and **different across sessions**. Adding noise on every `canvas.toDataURL()` call is worse than adding none — that is a bot fingerprint.
 
-## 3. Kiến trúc
+## 3. Architecture
 
 ```
 ┌─ f1stmux (CLI, Rust) ──┐   ┌─ f1stmux mcp (stdio) ─┐
-│  navigate, extract,    │   │  bridge sang HTTP     │
-│  bench, plugin, vault  │   │  (chạy ở bất kỳ đâu)  │
-└──────────┬─────────────┘   └──────────┬─────────────┘
+│  navigate, extract,    │   │  bridge to HTTP       │
+│  bench, plugin, vault  │   │  (runs anywhere)      │
+└──────────┬─────────────┘   └──────────┬────────────┘
            │ HTTP/WS JSON-RPC 2.0       │
-           └────────────┬───────────────┘
-                        ▼
-        ┌─────────── f1stmuxd (daemon Rust) ───────────┐
+           └─────────────┬──────────────┘
+                         ▼
+        ┌─────────── f1stmuxd (Rust daemon) ───────────┐
         │                                              │
-        │  session mgr ── ephemeral, id-keyed, RAM-only │
-        │  tab pool   ── N tab, tách tiến trình khi nặng  │
-        │  scheduler  ── queue, cron, retry/backoff      │
+        │  session mgr ─ ephemeral, id-keyed, RAM-only │
+        │  tab pool   ─ N tabs, fork a child process   │
+        │  scheduler  ─ queue, cron, retry/backoff     │
         │                                              │
-        │  ┌─ pipeline (mỗi navigation) ──────────────┐ │
-        │  │ fetch → parse → env → DOM → a11y → text   │ │
-        │  └───────────────────────────────────────────┘ │
+        │  ┌─ pipeline (per navigation) ─────────────┐ │
+        │  │ fetch → parse → env → DOM → a11y → text │ │
+        │  └─────────────────────────────────────────┘ │
         │                                              │
-        │  ┌─ thư viện ─────────────────────────────┐   │
-        │  │ tls   : TLS stack tùy chỉnh (JA3/JA4)   │   │
-        │  │ net   : HTTP/2, DoH, proxy chain, block  │   │
-        │  │ stealth: profile registry + JS noise     │   │
-        │  │ dom   : html5ever → DOM → a11y           │   │
-        │  │ js    : QuickJS (nhiều realm, cô lập)    │   │
-        │  │ vault : profile mã hoá, key mở trong RAM │   │
-        │  │ plugin: host js | wasm | proc            │   │
-        │  └─────────────────────────────────────────┘   │
+        │  ┌─ libraries ─────────────────────────────┐ │
+        │  │ tls   : custom TLS stack (JA3/JA4)      │ │
+        │  │ net   : HTTP/2, DoH, proxy chain, block │ │
+        │  │ stealth: profile registry + JS noise    │ │
+        │  │ dom   : html5ever → DOM → a11y          │ │
+        │  │ js    : QuickJS (multi-realm, isolated) │ │
+        │  │ vault : encrypted profiles, keys in RAM │ │
+        │  │ plugin: host js | wasm | proc           │ │
+        │  └─────────────────────────────────────────┘ │
+        │                                              │
         └──────────────────────────────────────────────┘
 ```
 
-### 3.1 Đường đi của một lần navigate
+### 3.1 The path of a single navigate
 
 ```
 tool call "navigate"
   → session/tab lookup
-  → build headers từ profile (order cố định)
-  → TLS handshake với cipher/extension order của profile
-  → (nếu có) DNS qua DoH, qua proxy chain
-  → GET, theo redirect có kiểm soát, gom cookie vào jar của session
-  → [plugin hook: onRequest / onResponse — có thể block/sửa/thêm]
+  → build headers from the profile (fixed order)
+  → TLS handshake with the profile's cipher/extension order
+  → (if any) DNS via DoH, through the proxy chain
+  → GET, following redirects under control, collecting cookies into the session jar
+  → [plugin hook: onRequest / onResponse — can block/modify/add]
   → HTML5 parse → DOM
-  → tạo QuickJS realm, cài DOM bridge + global object khớp profile
-  → chạy script tự nhiên, theo dõi mutation + network
-  → điều kiện hoàn tất (§7) hoặc hết budget → dừng
+  → create a QuickJS realm, install the DOM bridge + a global object matching the profile
+  → run page scripts naturally, watching mutations + network
+  → completion conditions (§7) or out of budget → stop
   → [plugin hook: onDOMReady]
-  → dựng a11y tree, trích text
-  → session tự hủy nếu ephemeral
+  → build the a11y tree, extract text
+  → the session destroys itself if ephemeral
 ```
 
-Điểm quan trọng: **DOM bridge phải là duy nhất**. Một cây DOM trong Rust, phơi sang JS qua bridge. Không có hai nguồn sự thật — nếu có, mọi bug DOM sẽ là bug khó tìm nhất trong hệ thống.
+The important point: **the DOM bridge must be the only one**. One DOM tree in Rust, exposed to JS through the bridge. There are no two sources of truth — if there were, every DOM bug would be the hardest bug to find in the whole system.
 
-### 3.2 Cô lập bộ nhớ
+### 3.2 Memory isolation
 
-Máy có 3.6 GB. Một OOM giết cả phiên làm việc.
+The machine has 3.6 GB. A single OOM kills the entire work session.
 
-- `--max-tabs`, `--max-ram` là giới hạn cứng, không phải gợi ý.
-- Realm QuickJS nặng hoặc tab nghi ngờ treo → tách sang tiến trình con, để được kill độc lập.
-- Mỗi session mặc định **RAM-only**: cookie, storage, cache sống trong RAM và biến mất khi process chết. Ghi xuống đĩa là tuỳ chọn tường minh (`--persist`), phải có mật khẩu.
+- `--max-tabs`, `--max-ram` are hard limits, not hints.
+- A heavy QuickJS realm or a tab suspected of hanging → move it into a child process so it can be killed independently.
+- Each session is **RAM-only** by default: cookies, storage, and cache live in RAM and vanish when the process dies. Writing to disk is an explicit opt-in (`--persist`) and requires a password.
 
-## 4. Hệ thống plugin
+## 4. Plugin system
 
-Mục tiêu: **cài thêm bất cứ thứ gì** — tool, inspector, parser, AI agent, proxy, storage backend, hook, scheduler, adapter OCR — mà không phải sửa core.
+Goal: **be able to install anything** — tools, inspectors, parsers, AI agents, proxies, storage backends, hooks, schedulers, OCR adapters — without modifying the core.
 
 ### 4.1 Manifest
 
@@ -175,149 +178,149 @@ Mục tiêu: **cài thêm bất cứ thứ gì** — tool, inspector, parser, AI
 }
 ```
 
-`api` là version của host API. Core từ chối plugin khai báo `api` cao hơn nó biết.
+`api` is the version of the host API. The core rejects any plugin that declares an `api` higher than it knows.
 
-### 4.2 Ba loại plugin
+### 4.2 Three kinds of plugins
 
-| Loại | Chạy | Dùng khi | Chi phí |
+| Kind | Runs in | Use when | Cost |
 |---|---|---|---|
-| `js` | Trong realm QuickJS của daemon | Logic nhanh, cần gọi hook, cần chặn request | ~0, hot path |
-| `proc` | Tiến trình con, stdio JSON-lines hoặc HTTP localhost | Python (giàu thư viện), Rust/Go/C (nhanh), shell, bọc tool có sẵn | +50–100 ms/call |
-| `wasm` | Module WASM trong host | Logic deterministic, cần cô lập chặt hơn `js` | nhỏ |
+| `js` | Inside the daemon's QuickJS realm | Fast logic, needs to call hooks, needs to block requests | ~0, hot path |
+| `proc` | Child process, stdio JSON-lines or localhost HTTP | Python (rich libraries), Rust/Go/C (fast), shell, wrapping existing tools | +50–100 ms/call |
+| `wasm` | WASM module inside the host | Deterministic logic, needs stricter isolation than `js` | small |
 
-Cả ba đều là **quy trình con hoặc sandbox**, không phải thư viện native gắn vào. Đây là quyết định cố ý: gắn native nghĩa là phải khớp ABI, đổi phiên bản là vỡ, và một plugin lỗi là sập daemon. `proc` chấp nhận độ trễ và đổi lại **mọi ngôn ngữ đều chạy được**.
+All three are **child processes or sandboxes**, not native libraries linked in. This is a deliberate decision: linking native code means matching the ABI, a version change breaks it, and one buggy plugin brings down the daemon. `proc` accepts the latency and in exchange **every language can run**.
 
-### 4.3 Cài đặt và vòng đời
+### 4.3 Installation and lifecycle
 
 ```
-f1stmux plugin install <git-url | thư mục | tarball | tên-đăng-ký>
-    → tải → đọc manifest → kiểm tra schema + permission → đặt vào ~/.f1stmux/plugins/<id>/
-    → daemon hot-load, KHÔNG cần restart
+f1stmux plugin install <git-url | directory | tarball | registry-name>
+    → download → read manifest → validate schema + permissions → place into ~/.f1stmux/plugins/<id>/
+    → daemon hot-loads it, NO restart needed
 f1stmux plugin list | info <id> | enable | disable | uninstall | grant <perm> | revoke <perm>
 ```
 
-Registry: thư mục local (`~/.f1stmux/plugins/`) và registry từ xa (opt-in, không mặc định).
+Registries: a local directory (`~/.f1stmux/plugins/`) and a remote registry (opt-in, not by default).
 
 ### 4.4 Sandbox
 
-- Permission allowlist trên manifest; plugin không khai báo permission thì không có.
-- `net.intercept` bị giới hạn theo host/scheme được cấp.
-- `js` bị giới hạn thời gian thực thi và quota bộ nhớ.
-- `proc` chạy không quyền, không môi trường ngoài, cwd riêng.
-- `/kill-switch` tắt mọi hook mà không cần uninstall — dành cho lúc nghi ngờ bị theo dõi.
+- Permissions are an allowlist on the manifest; a plugin that declares no permission has none.
+- `net.intercept` is limited to the granted host/scheme.
+- `js` is limited in execution time and memory quota.
+- `proc` runs unprivileged, with no inherited environment and its own cwd.
+- `/kill-switch` disables every hook without needing an uninstall — for when you suspect you are being tracked.
 
-### 4.5 Điểm can thiệp
+### 4.5 Interception points
 
-| Hook | Plugin được làm gì |
+| Hook | What the plugin may do |
 |---|---|
-| `onRequest` | Sửa header, chặn, thêm request, đổi URL, ghi HAR |
-| `onResponse` | Sửa body/header, chặn, phân tích |
-| `onDOMReady` | Đọc DOM, chạy script, trích text |
-| `onToolCall` | Thêm tool mới cho AI, chặn tool, ghi log |
-| `onPageScript` | Inject script vào realm trước khi page script chạy |
-| `onSessionCreate` / `onSessionEnd` | Theo dõi vòng đời session, tự dọn |
+| `onRequest` | Modify headers, block, add requests, change URLs, record HAR |
+| `onResponse` | Modify body/headers, block, analyze |
+| `onDOMReady` | Read the DOM, run scripts, extract text |
+| `onToolCall` | Register new tools for the AI, block tools, log |
+| `onPageScript` | Inject a script into the realm before the page scripts run |
+| `onSessionCreate` / `onSessionEnd` | Track the session lifecycle, self-cleanup |
 
-Bằng `onToolCall`, plugin có thể **đăng ký tool mới** — đây là đường mở rộng chính cho agent/parser/inspector tuỳ chỉnh mà không đụng core.
+Through `onToolCall` a plugin can **register new tools** — this is the main extension path for custom agents/parsers/inspectors without touching the core.
 
-## 5. Giao diện
+## 5. Interfaces
 
-| Bề mặt | Vai trò |
+| Surface | Role |
 |---|---|
-| HTTP + WebSocket JSON-RPC 2.0 | Giao thức gốc. Mọi thứ khác là client của nó. |
-| CLI | Cho người và script |
-| MCP stdio | Adapter mỏng map sang HTTP. Bắt buộc có, nhưng là *adapter*, không phải kiến trúc. |
-| CDP subset | Để Playwright/Puppeteer điều khiển được. Chỉ phần AI thực sự dùng. |
+| HTTP + WebSocket JSON-RPC 2.0 | The native protocol. Everything else is a client of it. |
+| CLI | For humans and scripts |
+| MCP stdio | A thin adapter mapping onto HTTP. Mandatory to have, but it is an *adapter*, not the architecture. |
+| CDP subset | So Playwright/Puppeteer can drive it. Only the part the AI actually uses. |
 
-**Quyết định:** HTTP JSON-RPC là nguồn sự thật, MCP là adapter. Lý do: daemon có thể chạy ở máy khác/termux-host, còn MCP client thì luôn nối local. Nếu MCP là gốc thì mọi người dùng non-MCP đều bị ép qua một tầng không cần.
+**Decision:** HTTP JSON-RPC is the source of truth, MCP is an adapter. The reason: the daemon may run on another machine / a termux host, while MCP clients always connect locally. If MCP were the root, every non-MCP user would be forced through a layer they do not need.
 
 ### 5.1 Tool surface (v1)
 
 `navigate` · `extract_text` · `snapshot_dom` · `snapshot_a11y` · `network_log` · `har_export` · `screenshot_dom` · `eval_js` · `click` · `type` · `select` · `scroll` · `wait_for` · `set_cookie` · `get_cookies` · `storage_set/get` · `new_tab` · `close_tab` · `list_tabs` · `download` · `upload` · `pdf` · `plugin_*` · `session_*` · `stealth_profile` · `bench`
 
-## 6. Phân phối
+## 6. Distribution
 
-| Kênh | Vai trò |
+| Channel | Role |
 |---|---|
-| `npm install -g f1stmux` | **Kênh chính.** Node đã có. Gói chứa prebuilt binary theo `os`/`arch` (`aarch64-linux-android` là target chính); `postinstall` chọn đúng file. |
-| `pkg install f1stmux` | Kế hoạch v1.1, PR vào `termux-packages`. |
-| `curl \| sh` | Không làm ở v1. Không cần thiết khi npm đã đủ. |
-| `cargo install --git` | Fallback cho người tự build. |
+| `npm install -g f1stmux` | **The primary channel.** Node is already there. The package contains prebuilt binaries per `os`/`arch` (`aarch64-linux-android` is the primary target); `postinstall` picks the right file. |
+| `pkg install f1stmux` | Planned for v1.1, PR into `termux-packages`. |
+| `curl \| sh` | Not doing this in v1. Unnecessary while npm is enough. |
+| `cargo install --git` | Fallback for people who build it themselves. |
 
-**Không làm `.deb`.** Vô dụng trên Termux, chỉ liên quan desktop Linux. Bỏ hẳn khỏi kế hoạch.
+**No `.deb`.** Useless on Termux, only relevant to desktop Linux. Dropped from the plan entirely.
 
-### 6.1 Không phone-home
+### 6.1 No phone-home
 
-Không telemetry. Không tự cập nhật. Không gọi registry nếu không `--yes`. Crash report không tự gửi. Lần chạy đầu chỉ hỏi một lần, kết quả lưu cục bộ, và `--telemetry=off` là mặc định **không đổi được trừ khi chỉ định rõ**.
+No telemetry. No self-update. No registry call without `--yes`. Crash reports are never sent automatically. The first run asks only once, the result is stored locally, and `--telemetry=off` is the default that **cannot be changed unless explicitly specified**.
 
-## 7. Điều kiện hoàn tất navigation, và hạn chế đã biết
+## 7. Navigation completion conditions, and known limitations
 
-### 7.1 Không có layout ⇒ phải bù bằng tín hiệu
+### 7.1 No layout ⇒ we must compensate with signals
 
-Ta chấp nhận hạn chế (bạn đã chốt). Cách bù:
+We accept the limitation (you already locked this in). How we compensate:
 
-1. `network idle` — không còn request nào trong `quiet_ms`.
-2. `DOM mutation hết tắt` — không còn mutation trong `quiet_ms`.
+1. `network idle` — no requests left within `quiet_ms`.
+2. `DOM mutations have stopped` — no mutations within `quiet_ms`.
 3. `readyState === 'complete'`.
-4. Ngân sách thời gian theo từng lớp tài nguyên.
-5. Nếu vẫn rỗng mà raw HTML có nội dung ⇒ đọc raw HTML. Không để tab trả về rỗng rồi báo thành công.
-6. Retry với điều kiện chờ khác khi timeout.
+4. A time budget per resource class.
+5. If it is still empty but the raw HTML has content ⇒ read the raw HTML. Never let a tab return empty and then report success.
+6. Retry with a different wait condition on timeout.
 
-### 7.2 Những gì ta **không** làm được, nói thẳng
+### 7.2 What we **cannot** do, stated plainly
 
-| Không làm được | Vì sao | Đường vòng |
+| Cannot do | Why | Workaround |
 |---|---|---|
-| Screenshot ảnh thật | Không có layout/raster | `screenshot_dom` dựng khung + vị trí text từ a11y |
-| Nội dung chỉ hiện theo layout | Không tính layout | Chấp nhận; ghi rõ giới hạn |
-| WebGL thật, WASM trong page đầy đủ | Engine giới hạn | `--engine=chromium` (v2) |
-| Google / site JS cực nặng | Tài nguyên 3.6 GB | Dùng bridge Chromium hoặc API chính thức |
-| Ẩn dấu hoàn hảo trước công nghệ chống bot đời mới | Bản chất của việc này | Luôn luồn, xoay profile/proxy, retry |
+| Real-image screenshots | No layout/raster | `screenshot_dom` builds the frame + text positions from a11y |
+| Content that only appears through layout | No layout computation | Accept it; state the limitation clearly |
+| Real WebGL, full WASM in the page | Limited engine | `--engine=chromium` (v2) |
+| Google / extremely JS-heavy sites | 3.6 GB of resources | Use a Chromium bridge or the official API |
+| Perfect stealth against next-generation anti-bot technology | The nature of this work | Always adapt, rotate profiles/proxies, retry |
 
-## 8. Rủi ro đã biết
+## 8. Known risks
 
-| Rủi ro | Mức | Giảm bằng |
+| Risk | Level | Mitigated by |
 |---|---|---|
-| Binding QuickJS không build được trên Termux | ✅ **Đã loại bỏ** | Phase 0 pass, có số đo |
-| Crypto backend của TLS không build trên Android | ✅ **Đã loại bỏ** | `ring` build được; phải cấu hình `default-features = false` (§0.1) |
-| TLS stack tùy chỉnh không cho JA4 | Trung bình | Tính thứ tự extension thủ công; nếu không được, chỉ cam kết JA3 |
-| **Không xác minh được JS→DOM bridge tương tác 2 chiều** | Cao | Phase 1 đầu tiên; đây là phần chưa có bằng chứng nào |
-| SPA đọc ra nội dung rỗng | Trung bình | §7.1 + ghi rõ giới hạn trong response |
-| Host chậm do hàng đợi nhiều tab | Thấp | Giới hạn tab, tách tiến trình |
-| Bị phát hiện ở tầng TLS | Trung bình | Profile nhất quán; không hứa "không bao giờ bị chặn" |
-| Người dùng tin rằng nó vô hạn mở rộng | Thấp | Mọi giới hạn đều viết ra, không giấu |
+| QuickJS binding cannot be built on Termux | ✅ **Eliminated** | Phase 0 passed, with measurements |
+| The TLS crypto backend does not build on Android | ✅ **Eliminated** | `ring` builds; `default-features = false` is required (§0.1) |
+| The custom TLS stack cannot produce JA4 | Medium | Compute the extension order manually; if not possible, only promise JA3 |
+| **Cannot verify the bidirectional JS→DOM bridge** | High | First in Phase 1; this is the part with no evidence at all |
+| An SPA reads out empty content | Medium | §7.1 + stating the limitation clearly in the response |
+| The host slows down from too many tabs in the queue | Low | Tab limits, process separation |
+| Getting detected at the TLS layer | Medium | Consistent profiles; do not promise "never blocked" |
+| Users believing it scales without limit | Low | Every limitation is written down, nothing hidden |
 
 ---
 
-## 8.1 Rủi ro *chưa* có bằng chứng
+## 8.1 Risks with *no* evidence yet
 
-Đọc §0 và dễ tưởng mọi thứ đã an toàn. Không phải. Đây là những thứ **chưa ai build**, kể cả tôi:
+Reading §0 it is easy to assume everything is safe. It is not. These are the things **nobody has built yet**, including me:
 
-- **JS ↔ DOM bridge hai chiều.** Spike chứng minh QuickJS chạy và `html5ever` parse được, nhưng chưa chứng minh chúng nói chuyện được với nhau theo cách mà một trang thật cần. Đây là phần có rủi ro cao nhất còn lại.
-- **JA3/JA4 thực tế.** `rustls` build được, nhưng liệu có tùy chỉnh được ClientHello đủ để giả ClientHello của Chrome không — chưa đo.
-- **Quy mô thật của RSS.** 6.7 MB là số của spike, không phải của sản phẩm.
-- **`wasmtime` trên Android.** Chưa build. Nếu nặng quá, `wasmi` là đường thay thế; plugin `wasm` dời sang sau.
-- **DOM bridge có đủ nhanh cho SPA thật** hay không.
+- **The bidirectional JS ↔ DOM bridge.** The spike proved QuickJS runs and `html5ever` parses, but it did not prove the two can talk to each other in the way a real page needs. This is the highest-risk piece left.
+- **Real JA3/JA4.** `rustls` builds, but whether the ClientHello can be customized enough to imitate Chrome's ClientHello is not yet measured.
+- **The true scale of RSS.** 6.7 MB is the spike's number, not the product's.
+- **`wasmtime` on Android.** Not built yet. If it is too heavy, `wasmi` is the fallback; `wasm` plugins move to a later phase.
+- Whether the **DOM bridge is fast enough for real SPAs**.
 
-## 9. Kế hoạch triển khai
+## 9. Implementation plan
 
-Mỗi phase có một cổng kiểm chứng. **Không qua cổng thì dừng, không làm tiếp.**
+Each phase has one verification gate. **If the gate is not passed, stop — do not continue.**
 
-| Phase | Nội dung | Cổng |
+| Phase | Content | Gate |
 |---|---|---|
-| **0 — Spike** | ✅ **Xong.** Số đo ở §0. Pass. | Đã pass |
-| 1 | Core: fetch → parse → DOM → text. HTTP/WS JSON-RPC, CLI. Session ephemeral. | Navigate + đọc text chạy trên site tĩnh thật |
-| 2 | Stealth 4 lớp + DoH + proxy + blocklist + vault | Vượt bot-check cơ bản, không rò DNS |
-| 3 | Plugin host (`js` + `proc`), registry, hook, permission | Cài plugin tùy ý, hook chạy đúng |
-| 4 | MCP, CDP subset, HAR, `screenshot_dom`, PDF | AI điều khiển trực tiếp qua MCP |
-| 5 | Queue, crawl, schedule, monitor, diff, notify, supervisor, npm publish | `bench` có số so sánh |
-| 6 | `--engine=chromium` bridge | Chỉ khi cần; core vẫn mặc định nhẹ |
+| **0 — Spike** | ✅ **Done.** Measurements in §0. Passed. | Passed |
+| 1 | Core: fetch → parse → DOM → text. HTTP/WS JSON-RPC, CLI. Session ephemeral. | Navigate + read text works on a real static site |
+| 2 | 4-layer stealth + DoH + proxy + blocklist + vault | Pass basic bot-checks, no DNS leak |
+| 3 | Plugin host (`js` + `proc`), registry, hooks, permissions | Install any plugin, hooks run correctly |
+| 4 | MCP, CDP subset, HAR, `screenshot_dom`, PDF | AI drives it directly through MCP |
+| 5 | Queue, crawl, schedule, monitor, diff, notify, supervisor, npm publish | `bench` has comparable numbers |
+| 6 | `--engine=chromium` bridge | Only when needed; core stays lightweight by default |
 
-### 9.1 Test và đo
+### 9.1 Tests and measurements
 
-- `f1stmux selftest` — correctness cho JS/DOM/stealth/chặn request. Chạy được trên chính máy này, không phụ thuộc CI ngoài.
-- `f1stmux bench --compare lightpanda` — cùng bộ URL: RSS, wall-clock, cold start, bytes, JS-heavy subset.
-- Golden files cho a11y/text extraction — chạy lại phải ra kết quả giống nhau.
-- Test chống leak: sau khi kill daemon, không còn file tạm, không còn cookie, không còn kết nối.
+- `f1stmux selftest` — correctness for JS/DOM/stealth/request blocking. Runnable on this very machine, no external CI dependency.
+- `f1stmux bench --compare lightpanda` — the same URL set: RSS, wall-clock, cold start, bytes, JS-heavy subset.
+- Golden files for a11y/text extraction — re-running must produce identical results.
+- Leak tests: after killing the daemon, no temp files remain, no cookies remain, no connections remain.
 
-## 10. Ngoài phạm vi
+## 10. Out of scope
 
-Không làm ở bất kỳ version nào nếu không có yêu cầu mới rõ ràng: `.deb`/rpm, extension Chrome, chế độ có GUI, đồng bộ cloud, tài khoản người dùng, marketplace UI, plugin marketplace trung tâm, tự động cập nhật.
+Not done in any version without a clear new requirement: `.deb`/rpm, Chrome extension, GUI mode, cloud sync, user accounts, marketplace UI, a central plugin marketplace, automatic updates.

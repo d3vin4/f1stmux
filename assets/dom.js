@@ -1,12 +1,12 @@
-// Lớp vờ DOM phía JS.
+// JS-side DOM shim.
 //
-// Cây DOM thật nằm trong Rust. File này chỉ tạo vỏ để QuickJS nhìn thấy nó, và
-// cung cấp `__f1host` — các hàm gọi ngược xuống Rust. Mọi đọc/ghi đều đi qua
-// đó, nên không có hai nguồn sự thật.
+// The real DOM tree lives in Rust. This file only builds a wrapper so QuickJS
+// can see it, exposing `__f1host` — callbacks down into Rust. All reads/writes
+// go through it, so there is no second source of truth.
 (function () {
   'use strict';
 
-  const H = globalThis.__f1host; // do Rust cài trước khi script này chạy
+  const H = globalThis.__f1host; // installed by Rust before this script runs
 
   class F1Node {
     constructor(id) { this.__id = id; }
@@ -68,7 +68,7 @@
     addEventListener() {}
     removeEventListener() {}
     getBoundingClientRect() {
-      // Không có layout engine. Trả về khung 0 để code phía trang không nổ.
+      // No layout engine. Return a zero rect so page code doesn't crash.
       return { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 };
     }
     get scrollTop() { return 0; }
@@ -109,7 +109,7 @@
     removeEventListener: () => {},
   };
 
-  // console: gần như mọi trang đều gọi. Nối vào H.log để tool đọc được.
+  // console: nearly every page calls it. Wired into H.log so tools can read it.
   const fmt = (a) => a.map((x) => { try { return typeof x === 'string' ? x : JSON.stringify(x); } catch (e) { return String(x); } }).join(' ');
   globalThis.console = {
     log: (...a) => H.log('log', fmt(a)),
@@ -126,7 +126,7 @@
     hardwareConcurrency: H.concurrency(),
     deviceMemory: H.deviceMemory(),
     maxTouchPoints: 5,
-    webdriver: false,           // giả. Ta là browser, không phải automation.
+    webdriver: false,           // spoofed. We are a browser, not automation.
     plugins: [],
     languages_len: 4,
     cookieEnabled: true,
@@ -151,7 +151,7 @@
   globalThis.HTMLElement = F1Node;
   globalThis.__f1doc = document;
 
-  // window.alert/confirm/prompt: treo script là tự giả. Trả về giá trị vô hại.
+  // window.alert/confirm/prompt: blocking calls would self-expose. Return harmless values.
   globalThis.alert = () => {};
   globalThis.confirm = () => false;
   globalThis.prompt = () => null;
