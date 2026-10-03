@@ -1,7 +1,22 @@
-# F1stmux — a headless browser for AI agents
+# F1stmux
 
-One binary. Terminal-only. Built for low-RAM machines (Termux/Android),
-where Chromium is not an option.
+[![Release](https://img.shields.io/github/v/release/d3vin4/f1stmux)](https://github.com/d3vin4/f1stmux/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-linux%20%7C%20android%20%7C%20termux-lightgrey.svg)](#install)
+
+[Tieng Viet](README.vi.md)
+
+A headless browser for AI agents that runs where Chromium cannot. One static
+binary, terminal-only, about 7 MB of RAM on Termux/Android (aarch64, measured).
+
+F1stmux fetches a page, parses it with a real HTML5 parser, runs its scripts
+in QuickJS against a DOM bridge, and hands you text, DOM, console output,
+network log, and HAR. Sessions live in RAM — closing wipes every cookie,
+cache entry, and trace.
+
+When a page needs real layout or a full JavaScript engine, `--engine chromium`
+attaches to a real Chromium over CDP. Without a backend, F1stmux says so
+plainly instead of faking pixels.
 
 ```
 f1stmux get https://example.com/ --json
@@ -10,25 +25,32 @@ f1stmux serve   # JSON-RPC + web DevTools at 127.0.0.1:7070
 f1stmux mcp     # MCP server over stdio (opencode, Claude Code, ...)
 ```
 
-F1stmux fetches a page, parses it with a real HTML5 parser, runs its
-scripts in QuickJS against a DOM bridge, and hands you text, DOM,
-console output, network log, and HAR. Sessions live in RAM —
-close it and every cookie, cache entry, and trace is gone.
+## Why F1stmux
 
-## Measured numbers (Termux, aarch64 — not estimates)
+| | F1stmux | Full browsers | curl + scripts |
+|---|---|---|---|
+| RAM per session | ~7 MB | hundreds of MB | ~1 MB |
+| JavaScript | QuickJS subset (+ Chromium over CDP when needed) | full | none |
+| AI control (MCP/JSON-RPC/CLI) | native, 20 tools | via automation layers | hand-rolled |
+| Captcha handling | detect + human-solve portal, never auto-opens targets | manual | manual |
+| Runs on Termux/Android | yes, verified | no | yes |
+
+## Measured numbers
+
+Termux, aarch64. Not estimates.
 
 | Metric | Value |
 |---|---|
 | Binary (stripped release) | 5.4 MB |
 | Daemon RSS after navigations | ~7 MB |
-| `GET example.com` | 200 in ~0.5–0.7 s |
-| Hacker News front page | 200, 4200+ chars, zero JS errors |
-| GitHub / Google homepages | readable content, JS errors tolerated |
-| Rutracker (windows-1251, CF-fronted) | 200, correct Cyrillic decoding |
+| `GET example.com` | HTTP 200 in ~0.5–0.7 s |
+| Hacker News front page | HTTP 200, 4200+ chars, zero JS errors |
+| GitHub / Google homepages | readable content, page JS errors tolerated |
+| Cyrillic (windows-1251) page behind Cloudflare | HTTP 200, correct decoding |
 
 ## Install
 
-Requires Rust (1.85+) and `libclang` for the QuickJS bindings:
+Requires Rust 1.85+ and `libclang` for the QuickJS bindings:
 
 ```sh
 git clone https://github.com/d3vin4/f1stmux
@@ -37,8 +59,11 @@ cargo build --release
 ./target/release/f1stmux --help
 ```
 
-`npm install -g f1stmux` with prebuilt binaries (including
-`aarch64-linux-android`) is planned; see [Roadmap](#roadmap).
+Or download the static binary from
+[Releases](https://github.com/d3vin4/f1stmux/releases) and put it on `PATH`.
+
+Prebuilt packages (`npm install -g f1stmux`, `pkg install f1stmux`) are on the
+[roadmap](#roadmap).
 
 ## Use it from an agent
 
@@ -48,15 +73,15 @@ cargo build --release
 { "mcpServers": { "f1stmux": { "command": "f1stmux", "args": ["mcp"] } } }
 ```
 
-18 tools: `navigate`, `query`, `eval_js`, `extract_text`, `snapshot_dom`,
+20 tools: `navigate`, `query`, `eval_js`, `extract_text`, `snapshot_dom`,
 `screenshot`, `pdf`, `audit`, `network_log`, `har_export`, `blocklist_test`,
-`stealth_profile`, session management, plugin management, challenge tickets. See
-[`skills/f1stmux/SKILL.md`](skills/f1stmux/SKILL.md) for the agent guide.
+`stealth_profile`, session management, plugin management, challenge tickets.
+See [`skills/f1stmux/SKILL.md`](skills/f1stmux/SKILL.md) for the agent guide.
 
 **HTTP.** `f1stmux serve` exposes JSON-RPC 2.0 at `/rpc`, a CDP subset
 at `/cdp`, and a web DevTools UI at `/devtools` — open it in your phone's
-Chrome: Elements, Console, Network, HAR/DOM download.
-Inspection is HTTP-only (no WebSocket upgrade); the UI polls `/cdp`.
+browser: Elements, Console, Network, HAR/DOM download.
+Inspection runs over plain HTTP (no WebSocket upgrade); the UI polls `/cdp`.
 
 > **Remote mode.** The daemon has no authentication. It binds loopback by
 > default and *refuses* non-loopback binds unless you pass `--allow-remote`
@@ -75,11 +100,13 @@ f1stmux pdf URL -o page.pdf                     # real-layout PDF
 ```
 
 Needs a running Chromium with remote debugging: set `F1STCHROME_CDP=host:port`
-or have `chrome-headless-shell`/`chromium` on PATH for auto-spawn.
+or have `chrome-headless-shell`/`chromium` on `PATH` for auto-spawn.
 Without a backend the command fails with a clear message — screenshot/pdf then
 use labeled DOM fallbacks, never fake pixel layout.
 
-## Privacy (defaults, not options)
+## Privacy
+
+Defaults, not options.
 
 - No telemetry, no auto-update, no phone-home, no disk logging.
 - Ephemeral sessions: RAM-only cookies, storage, and cache.
@@ -94,20 +121,29 @@ use labeled DOM fallbacks, never fake pixel layout.
 
 Consistent identity profiles (`chrome`, `edge`, `brave`): User-Agent,
 header order, Client Hints, locale, timezone, screen, hardware concurrency.
-Stable within a session, fresh across sessions — per-call noise is a bot
-signal, so we never do it. Tracker/ad blocking via compact rule syntax
-(`||host^`, `|scheme`, `/path/`, `@@` exceptions).
+Stable within a session, fresh across sessions — per-request noise is a bot
+signal, so it is never generated. Tracker/ad blocking uses compact rule
+syntax (`||host^`, `|scheme`, `/path/`, `@@` exceptions), enforced on
+documents and subresource scripts alike.
 
 ## Captchas
 
 Detected and reported, never silently ignored: `navigate` returns a
-`captcha` field (`cloudflare`, `recaptcha`, `hcaptcha`, `turnstile`, …).
+`captcha` field (`cloudflare`, `recaptcha`, `hcaptcha`, `turnstile`, …) plus
+the extracted form state (`captcha_tokens`).
 F1stmux does **not** solve challenges — but it offers a human-solve portal:
 `navigate(url, on_challenge="portal")` creates a ticket and serves a
 loopback page where a person solves the challenge in a real browser, pastes
 the token, and f1stmux replays it into the session. The destination URL is
 returned, never auto-opened. Fake tokens are rejected by the target server,
 so only genuine human solves pass. See `challenge_create` / `challenge_result`.
+
+## Security audit
+
+`f1stmux audit URL` inspects response headers, CSP/CORS, cookies, and scans
+page source for endpoint and CVE-ID literals. Every finding carries the raw
+evidence it came from. It reports observations — it does not invent
+vulnerabilities, guess versions, or assign severity beyond `info`/`warn`/`risk`.
 
 ## Plugins
 
@@ -127,30 +163,13 @@ f1stmux plugin install <dir|git-url|tarball>   # hot-loaded, no restart
 
 Manifest + permission allowlist + global kill switch.
 
-## How it compares
-
-Lightpanda (Servo-based) is the closest project. Honest scorecard:
-
-| | F1stmux | Lightpanda |
-|---|---|---|
-| RAM idle | ~7 MB measured | ~70–90 MB |
-| Binary | 4.1 MB | tens of MB |
-| Builds on Termux/Android | yes, verified | x86_64 only |
-| JS fidelity | QuickJS subset | V8 (full) |
-| Pixel rendering | no (DOM mock only) | partial |
-| Plugin system | js/proc/wasm + hooks | — |
-
-We win on footprint and hackability; we lose on JS fidelity and rendering.
-If you need pixel screenshots or heavy SPAs, use a real browser engine —
-F1stmux plans an optional `--engine=chromium` bridge for exactly that.
-
 ## Roadmap
 
 - [ ] `npm install -g f1stmux` with prebuilt binaries
 - [ ] `pkg install f1stmux` (termux-packages)
 - [ ] WASM plugin host on Android
-- [ ] `--engine=chromium` bridge for pixel/JS-heavy pages
 - [ ] Full JA4 TLS parroting
+- [ ] SSRF IP policy + auth tokens for remote mode
 
 ## License
 
