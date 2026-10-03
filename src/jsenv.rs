@@ -128,7 +128,7 @@ impl Realm {
             host.set("setText", Function::new(ctx.clone(), {
                 let d = dom.clone();
                 move |id: i32, v: String| {
-                    if let Some(n) = d.borrow_mut().nodes.get_mut(id as usize) { n.text = v; }
+                    d.borrow_mut().set_text_content(id as usize, &v);
                 }
             })?)?;
             host.set("remove", Function::new(ctx.clone(), {

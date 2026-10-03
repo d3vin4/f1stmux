@@ -31,7 +31,7 @@ For opencode (`opencode.json`):
 }
 ```
 
-You get 18 tools. The ones you will use daily:
+You get 37 tools. The ones you will use daily:
 
 | Tool | Purpose |
 |---|---|
@@ -41,6 +41,14 @@ You get 18 tools. The ones you will use daily:
 | `extract_text` / `snapshot_dom` | Re-read current tab without re-fetching |
 | `network_log` / `har_export` | What the page actually requested |
 | `blocklist_test` | Check if a URL would be blocked |
+| `tabs` / `history` / `back` / `forward` | Tab list and history travel (sessions are tabs) |
+| `click` / `type_text` / `press` / `select` | Real automation (dispatches page listeners) |
+| `wait_for` | Wait for selector/text, no blind sleeps |
+| `open` | Omnibox: URL, bare domain, bookmark, or history match |
+| `bookmark_add` / `bookmark_list` / `bookmark_remove` | Persistent bookmarks |
+| `download` / `downloads` | Fetch files to disk, list them |
+| `cookies` | List/clear/set session cookies |
+| `settings` | Read/set profile, proxy, doh, engine |
 
 Sessions are RAM-only, isolated per session (cookies, JS storage, network
 log). Pass `session` to keep state across calls; omit it to start fresh.

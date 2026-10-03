@@ -31,7 +31,7 @@ f1stmux mcp     # MCP server over stdio (opencode, Claude Code, ...)
 |---|---|---|---|
 | RAM per session | ~7 MB | hundreds of MB | ~1 MB |
 | JavaScript | QuickJS subset (+ Chromium over CDP when needed) | full | none |
-| AI control (MCP/JSON-RPC/CLI) | native, 20 tools | via automation layers | hand-rolled |
+| AI control (MCP/JSON-RPC/CLI) | native, 37 tools | via automation layers | hand-rolled |
 | Captcha handling | detect + human-solve portal, never auto-opens targets | manual | manual |
 | Runs on Termux/Android | yes, verified | no | yes |
 
@@ -73,9 +73,12 @@ Prebuilt packages (`npm install -g f1stmux`, `pkg install f1stmux`) are on the
 { "mcpServers": { "f1stmux": { "command": "f1stmux", "args": ["mcp"] } } }
 ```
 
-20 tools: `navigate`, `query`, `eval_js`, `extract_text`, `snapshot_dom`,
+37 tools: `navigate`, `query`, `eval_js`, `extract_text`, `snapshot_dom`,
 `screenshot`, `pdf`, `audit`, `network_log`, `har_export`, `blocklist_test`,
-`stealth_profile`, session management, plugin management, challenge tickets.
+`stealth_profile`, tabs (`tabs`, `history`, `back`, `forward`), automation
+(`click`, `type_text`, `press`, `select`, `wait_for`), `open` omnibox,
+bookmarks, downloads, `cookies`, `settings`, session management,
+plugin management, challenge tickets.
 See [`skills/f1stmux/SKILL.md`](skills/f1stmux/SKILL.md) for the agent guide.
 
 **HTTP.** `f1stmux serve` exposes JSON-RPC 2.0 at `/rpc`, a CDP subset
@@ -88,8 +91,21 @@ Inspection runs over plain HTTP (no WebSocket upgrade); the UI polls `/cdp`.
 > (or `"allow_remote": true`). Only expose it to a network you trust —
 > anyone who can reach it can browse, install plugins, and fetch internal URLs.
 
-**CLI.** `get`, `eval`, `tree`, `bench`, `screenshot`, `pdf`, `audit`, and
-a terminal DevTools REPL (`f1stmux devtools URL`).
+**CLI.** `get`, `eval`, `tree`, `bench`, `screenshot`, `pdf`, `audit`,
+`bookmark`, `download`, `open`, and a terminal DevTools REPL
+(`f1stmux devtools URL`).
+
+## Browser behavior
+
+Sessions are tabs: each keeps its own history, cookies, storage, and network
+log. `back`/`forward` travel history without recording duplicates, `tabs`
+lists open tabs, `history` shows the URL trail. Bookmarks persist in
+`~/.f1stmux/bookmarks.json`; downloads go to `~/.f1stmux/downloads`.
+Automation is real — `click` dispatches to page listeners, `type_text` fires
+`input`/`change`, `press` sends keyboard events, `select` fires `change`,
+and `wait_for` polls instead of sleeping blind. `open` resolves URLs, bare
+domains, bookmarks, and history (there is no search provider — it says so
+instead of guessing).
 
 ## Chromium engine (`--engine`)
 

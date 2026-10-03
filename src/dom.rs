@@ -87,8 +87,31 @@ impl Dom {
         out
     }
 
-    pub fn set_attr(&mut self, id: usize, k: &str, v: &str) -> bool {
-        let Some(n) = self.nodes.get_mut(id) else { return false };
+    /// Browser textContent setter semantics: replace all children with a single
+    /// text node. (Reading only looks at #text children, so writing to the
+    /// element's own text field would be silently invisible.)
+    pub fn set_text_content(&mut self, id: usize, v: &str) -> bool {
+        if self.nodes.get(id).is_none() {
+            return false;
+        }
+        let tid = self.nodes.len();
+        self.nodes.push(Node {
+            id: tid,
+            parent: Some(id),
+            name: "#text".into(),
+            attrs: vec![],
+            text: v.to_string(),
+            children: vec![],
+            raw: false,
+        });
+        if let Some(n) = self.nodes.get_mut(id) {
+            n.children = vec![tid];
+            n.text.clear();
+        }
+        true
+    }
+
+    pub fn set_attr(&mut self, id: usize, k: &str, v: &str) -> bool {        let Some(n) = self.nodes.get_mut(id) else { return false };
         match n.attrs.iter_mut().find(|(a, _)| a == k) {
             Some(e) => e.1 = v.to_string(),
             None => n.attrs.push((k.into(), v.into())),

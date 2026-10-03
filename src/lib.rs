@@ -7,6 +7,7 @@
 
 pub mod blocklist;
 pub mod audit;
+pub mod bookmarks;
 pub mod challenge;
 pub mod cli;
 pub mod config;

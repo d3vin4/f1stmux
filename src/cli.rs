@@ -15,7 +15,7 @@ pub async fn get(cfg: &Config, url: &str, js: bool) -> Result<crate::session::Na
         return browser_get(cfg, url).await;
     }
     let mut sess = Session::new();
-    navigate(url, cfg, &mut sess, &WaitFor::default(), js).await
+    navigate(url, cfg, &mut sess, &WaitFor::default(), js, true).await
 }
 
 pub async fn eval(cfg: &Config, url: &str, script: &str) -> Result<serde_json::Value, String> {
@@ -23,7 +23,7 @@ pub async fn eval(cfg: &Config, url: &str, script: &str) -> Result<serde_json::V
         return browser_eval(cfg, url, script).await;
     }
     let mut sess = Session::new();
-    navigate(url, cfg, &mut sess, &WaitFor::default(), true).await?;
+    navigate(url, cfg, &mut sess, &WaitFor::default(), true, true).await?;
     crate::session::eval(&sess, script)
 }
 
@@ -39,7 +39,7 @@ fn wants_chromium(cfg: &Config) -> bool {
 /// pipeline (parse → text/tokens/captcha) on the *rendered* HTML.
 /// No faking: without a backend this returns an error, never fast output
 /// disguised as rendered output.
-pub async fn browser_get(cfg: &Config, url: &str) -> Result<crate::session::NavResult, String> {
+pub async fn browser_get(_cfg: &Config, url: &str) -> Result<crate::session::NavResult, String> {
     let t0 = Instant::now();
     let (cdp_base, mut child) = crate::net::spawn_chrome().await?;
     let out = async {
@@ -136,7 +136,7 @@ pub async fn bench(cfg: &Config, urls_file: Option<&str>, compare: Option<&str>)
     for u in &urls {
         let mut sess = Session::new();
         let t = Instant::now();
-        match navigate(u, cfg, &mut sess, &WaitFor::default(), true).await {
+        match navigate(u, cfg, &mut sess, &WaitFor::default(), true, true).await {
             Ok(r) => {
                 let short: String = u.chars().take(50).collect();
                 println!("{short:<52} {:>7} {:>9} {:>9}", r.status, t.elapsed().as_millis(), r.text.len());
@@ -182,7 +182,7 @@ pub async fn devtools(cfg: &Config, url: &str) -> Result<(), String> {
     use std::io::Write;
 
     let mut sess = Session::new();
-    let nav = navigate(url, cfg, &mut sess, &WaitFor::default(), true).await?;
+    let nav = navigate(url, cfg, &mut sess, &WaitFor::default(), true, true).await?;
     println!("loaded {} -> {} ({})", nav.final_url, nav.status, nav.elapsed_ms);
     println!("title: {}", nav.title);
     println!("text:  {} chars", nav.text.len());
@@ -232,7 +232,7 @@ pub async fn devtools(cfg: &Config, url: &str) -> Result<(), String> {
 
 pub async fn audit(cfg: &Config, url: &str) -> Result<(), String> {
     let mut sess = crate::session::Session::new();
-    let r = crate::session::navigate(url, cfg, &mut sess, &crate::session::WaitFor::default(), false).await?;
+    let r = crate::session::navigate(url, cfg, &mut sess, &crate::session::WaitFor::default(), false, true).await?;
     let cookies: Vec<crate::fetch::Cookie> = sess.cookies.all().iter().cloned().collect();
     let mut a = crate::audit::audit_from(
         &r.final_url,
@@ -247,5 +247,85 @@ pub async fn audit(cfg: &Config, url: &str) -> Result<(), String> {
     for f in &a.findings {
         println!("[{:4}] {}\n       {}", f.level, f.title, f.evidence);
     }
+    Ok(())
+}
+
+/// CLI bookmarks: add <url> [title] | list | rm <url-or-title>.
+pub fn bookmark_cli(op: &str, arg: Option<&str>, title: Option<&str>) -> Result<(), String> {
+    match op {
+        "add" => {
+            let url = arg.unwrap_or("");
+            let b = crate::bookmarks::add(title.unwrap_or(""), url)?;
+            println!("{}  {}", b.title, b.url);
+            Ok(())
+        }
+        "list" => {
+            for b in crate::bookmarks::list() {
+                println!("{}  {}", b.title, b.url);
+            }
+            Ok(())
+        }
+        "rm" | "remove" | "del" => {
+            let q = arg.unwrap_or("");
+            println!("{}", if crate::bookmarks::remove(q)? { "removed" } else { "not found" });
+            Ok(())
+        }
+        _ => Err("usage: bookmark <add|list|rm> [url] [title]".into()),
+    }
+}
+
+/// CLI download: fetch bytes and write into the download dir.
+pub async fn download_cli(cfg: &Config, url: &str, out: Option<&str>) -> Result<(), String> {
+    let prof = crate::stealth::profile(&cfg.profile)
+        .ok_or_else(|| format!("no profile `{}`", cfg.profile))?;
+    let (fetched, bytes) = crate::fetch::get_bytes(url, cfg, prof, "").await?;
+    let dir = download_dir(cfg)?;
+    let name = out.map(str::to_string).filter(|x| !x.is_empty()).unwrap_or_else(|| file_name(&fetched, url));
+    if name.contains('/') || name.contains('\\') {
+        return Err("output name must be a plain file name".into());
+    }
+    let dest = std::path::Path::new(&dir).join(&name);
+    std::fs::write(&dest, &bytes).map_err(|e| e.to_string())?;
+    println!("{} bytes -> {}", bytes.len(), dest.to_string_lossy());
+    Ok(())
+}
+
+pub(crate) fn download_dir(cfg: &Config) -> Result<String, String> {
+    let dir = cfg.download_dir.clone().unwrap_or_else(|| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        format!("{home}/.f1stmux/downloads")
+    });
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir)
+}
+
+pub(crate) fn file_name(fetched: &crate::fetch::Fetched, url: &str) -> String {
+    if let Some(cd) = fetched.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("content-disposition"))
+        && let Some(i) = cd.1.find("filename=")
+    {
+        let n = cd.1[i + 9..].trim().trim_matches(['"', '\'']).trim().to_string();
+        if !n.is_empty() && !n.contains('/') && !n.contains('\\') {
+            return n;
+        }
+    }
+    url.split(['?', '#']).next().unwrap_or(url)
+        .rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or("download.bin").to_string()
+}
+
+/// CLI omnibox: resolve text, then print the navigation as text.
+pub async fn open_cli(cfg: &Config, text: &str) -> Result<(), String> {
+    let t = text.trim();
+    let target = if t.contains("://") {
+        t.to_string()
+    } else if !t.contains(' ') && t.contains('.') && !t.starts_with('.') {
+        format!("https://{t}")
+    } else if let Some(b) = crate::bookmarks::find(t) {
+        println!("bookmark: {}  {}", b.title, b.url);
+        b.url
+    } else {
+        return Err("no URL, bookmark, or history match (no search provider configured)".into());
+    };
+    let r = get(cfg, &target, true).await?;
+    println!("{}", r.text);
     Ok(())
 }

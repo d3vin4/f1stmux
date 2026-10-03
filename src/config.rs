@@ -23,6 +23,8 @@ pub struct Config {
     /// Engine: fast | chromium | auto. Chromium needs a CDP endpoint
     /// (F1STCHROME_CDP=host:port or a local chrome-headless-shell binary).
     pub engine: String,
+    /// Download directory. None = ~/.f1stmux/downloads.
+    pub download_dir: Option<String>,
 }
 
 impl Default for Config {
@@ -39,6 +41,7 @@ impl Default for Config {
             persist: false,
             allow_remote: false,
             engine: "fast".into(),
+            download_dir: None,
         }
     }
 }

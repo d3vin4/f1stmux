@@ -69,6 +69,12 @@ enum Cmd {
     Screenshot { url: String, #[arg(long, short = 'o')] out: String },
     /// PDF via Chromium CDP (real layout).
     Pdf { url: String, #[arg(long, short = 'o')] out: String },
+    /// Bookmarks: add <url> [title] | list | rm <url-or-title>.
+    Bookmark { op: String, arg: Option<String>, title: Option<String> },
+    /// Download a URL to disk (~/​.f1stmux/downloads by default).
+    Download { url: String, #[arg(long, short = 'o')] out: Option<String> },
+    /// Omnibox: URL, bare domain, bookmark, or history lookup.
+    Open { text: String },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -166,6 +172,9 @@ async fn run(cfg: &Config, cmd: Cmd) -> Result<(), String> {
         Cmd::Audit { url } => f1stmux::cli::audit(cfg, &url).await,
         Cmd::Screenshot { url, out } => f1stmux::net::screenshot(cfg, &url, &out).await,
         Cmd::Pdf { url, out } => f1stmux::net::pdf(cfg, &url, &out).await,
+        Cmd::Bookmark { op, arg, title } => f1stmux::cli::bookmark_cli(&op, arg.as_deref(), title.as_deref()),
+        Cmd::Download { url, out } => f1stmux::cli::download_cli(cfg, &url, out.as_deref()).await,
+        Cmd::Open { text } => f1stmux::cli::open_cli(cfg, &text).await,
     }
 }
 

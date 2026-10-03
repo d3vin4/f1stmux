@@ -31,7 +31,7 @@ f1stmux mcp     # MCP server qua stdio (opencode, Claude Code, ...)
 |---|---|---|---|
 | RAM mỗi session | ~7 MB | hàng trăm MB | ~1 MB |
 | JavaScript | QuickJS subset (+ Chromium qua CDP khi cần) | đầy đủ | không có |
-| Điều khiển bởi AI (MCP/JSON-RPC/CLI) | native, 20 tools | qua lớp automation | tự viết tay |
+| Điều khiển bởi AI (MCP/JSON-RPC/CLI) | native, 37 tools | qua lớp automation | tự viết tay |
 | Xử lý captcha | detect + portal cho người giải, không bao giờ tự mở đích | thủ công | thủ công |
 | Chạy trên Termux/Android | có, đã verify | không | có |
 
@@ -73,9 +73,12 @@ Gói cài sẵn (`npm install -g f1stmux`, `pkg install f1stmux`) đang ở
 { "mcpServers": { "f1stmux": { "command": "f1stmux", "args": ["mcp"] } } }
 ```
 
-20 tools: `navigate`, `query`, `eval_js`, `extract_text`, `snapshot_dom`,
+37 tools: `navigate`, `query`, `eval_js`, `extract_text`, `snapshot_dom`,
 `screenshot`, `pdf`, `audit`, `network_log`, `har_export`, `blocklist_test`,
-`stealth_profile`, quản lý session, quản lý plugin, challenge tickets.
+`stealth_profile`, tabs (`tabs`, `history`, `back`, `forward`), automation
+(`click`, `type_text`, `press`, `select`, `wait_for`), `open` omnibox,
+bookmarks, downloads, `cookies`, `settings`, quản lý session,
+quản lý plugin, challenge tickets.
 Xem [`skills/f1stmux/SKILL.md`](skills/f1stmux/SKILL.md) để biết cách dùng chi tiết.
 
 **HTTP.** `f1stmux serve` mở JSON-RPC 2.0 tại `/rpc`, một tập con CDP tại
@@ -88,8 +91,20 @@ Inspection chạy qua HTTP thuần (không upgrade WebSocket); giao diện poll 
 > (hoặc `"allow_remote": true`). Chỉ mở ra mạng mà bạn tin tưởng —
 > ai chạm được vào nó đều có thể browse, cài plugin và fetch URL nội bộ.
 
-**CLI.** `get`, `eval`, `tree`, `bench`, `screenshot`, `pdf`, `audit`, và
-vòng lặp DevTools trong terminal (`f1stmux devtools URL`).
+**CLI.** `get`, `eval`, `tree`, `bench`, `screenshot`, `pdf`, `audit`,
+`bookmark`, `download`, `open`, và vòng lặp DevTools trong terminal
+(`f1stmux devtools URL`).
+
+## Hành vi browser
+
+Session chính là tab: mỗi tab giữ history, cookie, storage và network log
+riêng. `back`/`forward` đi lại history mà không ghi trùng, `tabs` liệt kê tab
+đang mở, `history` xem trail URL. Bookmark lưu ở `~/.f1stmux/bookmarks.json`;
+download vào `~/.f1stmux/downloads`.
+Automation là thật — `click` dispatch tới listener của trang, `type_text` bắn
+`input`/`change`, `press` gửi sự kiện phím, `select` bắn `change`, còn
+`wait_for` poll thay vì sleep mù. `open` phân giải URL, domain trần, bookmark
+và history (không có search provider — nói rõ chứ không đoán bừa).
 
 ## Engine Chromium (`--engine`)
 

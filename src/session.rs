@@ -75,6 +75,9 @@ pub struct Session {
     pub kill_switch: bool,
     /// This session's own JS storage — every Realm in the session shares this map.
     pub js_store: crate::jsenv::SessionStore,
+    /// Navigation history (final URLs); hist_idx points at the current entry.
+    pub history: Vec<String>,
+    pub hist_idx: usize,
 }
 
 impl Session {
@@ -137,6 +140,7 @@ pub async fn navigate(
     sess: &mut Session,
     wait: &WaitFor,
     run_js: bool,
+    record: bool,
 ) -> Result<NavResult, String> {
     let prof = stealth::profile(&cfg.profile).ok_or_else(|| {
         format!("no profile `{}` (available: {})", cfg.profile, stealth::names().join(", "))
@@ -301,7 +305,37 @@ pub async fn navigate(
     sess.dom = Some(dom.clone());
     sess.realm = Some(Box::new(realm));
     sess.last = Some(res.clone());
+    if record {
+        sess.history.truncate(sess.hist_idx.saturating_add(1).min(sess.history.len()));
+        if sess.history.last().map(|u| u != &res.final_url).unwrap_or(true) {
+            sess.history.push(res.final_url.clone());
+        }
+        sess.hist_idx = sess.history.len().saturating_sub(1);
+    }
     Ok(res)
+}
+
+/// Go back/forward in this tab's history without recording a new entry.
+pub async fn travel(
+    cfg: &Config,
+    sess: &mut Session,
+    wait: &WaitFor,
+    delta: i64,
+) -> Result<NavResult, String> {
+    if sess.history.is_empty() {
+        return Err("empty history".into());
+    }
+    let next = (sess.hist_idx as i64 + delta).clamp(0, sess.history.len() as i64 - 1) as usize;
+    if next == sess.hist_idx {
+        return Err(if delta < 0 { "already at the first page".into() } else { "already at the latest page".into() });
+    }
+    sess.hist_idx = next;
+    let url = sess.history[next].clone();
+    // travel() must not push: navigate with record=false, then re-pin the index
+    // (a same-URL redirect could otherwise shift it).
+    let r = navigate(&url, cfg, sess, wait, true, false).await?;
+    sess.hist_idx = next.min(sess.history.len().saturating_sub(1));
+    Ok(r)
 }
 
 /// Run JS on an already-loaded tab, return JSON.

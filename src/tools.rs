@@ -77,7 +77,7 @@ pub async fn tool(srv: &Arc<crate::rpc::Server>, name: &str, p: &Value) -> Resul
             let mut m = srv.sessions.lock().unwrap();
             let sess = m.get_mut(&id).ok_or("session does not exist")?;
             let cfg = srv.config();
-            let mut r = crate::session::navigate(&url, &cfg, sess, &wait, run_js).await?;
+            let mut r = crate::session::navigate(&url, &cfg, sess, &wait, run_js, true).await?;
             drop(m);
             // on_challenge=portal: on hitting a challenge, create a human-solve ticket.
             // The default (ignore) only sets the captcha flag and does nothing else.
@@ -264,8 +264,286 @@ pub async fn tool(srv: &Arc<crate::rpc::Server>, name: &str, p: &Value) -> Resul
             "api": crate::plugin::CURRENT_API_VERSION,
         })),
 
+        // ---- tabs & history (sessions are tabs) ----
+        "tabs" => {
+            let m = srv.sessions.lock().unwrap();
+            let tabs: Vec<Value> = m.values().map(|x| {
+                let last = x.last.as_ref();
+                json!({
+                    "id": x.id,
+                    "title": last.map(|r| r.title.clone()).unwrap_or_default(),
+                    "url": last.map(|r| r.final_url.clone()).unwrap_or_default(),
+                    "history_len": x.history.len(),
+                })
+            }).collect();
+            Ok(json!({ "count": tabs.len(), "tabs": tabs }))
+        }
+        "back" => {
+            let id = need_sess(srv, p)?;
+            let wait = WaitFor {
+                quiet_ms: p.get("quiet_ms").and_then(Value::as_u64).unwrap_or(250),
+                budget_ms: p.get("budget_ms").and_then(Value::as_u64).unwrap_or(10_000),
+            };
+            let mut m = srv.sessions.lock().unwrap();
+            let sess = m.get_mut(&id).ok_or("session does not exist")?;
+            let cfg = srv.config();
+            let r = crate::session::travel(&cfg, sess, &wait, -1).await?;
+            Ok(serde_json::to_value(&r).unwrap_or(Value::Null))
+        }
+        "forward" => {
+            let id = need_sess(srv, p)?;
+            let wait = WaitFor {
+                quiet_ms: p.get("quiet_ms").and_then(Value::as_u64).unwrap_or(250),
+                budget_ms: p.get("budget_ms").and_then(Value::as_u64).unwrap_or(10_000),
+            };
+            let mut m = srv.sessions.lock().unwrap();
+            let sess = m.get_mut(&id).ok_or("session does not exist")?;
+            let cfg = srv.config();
+            let r = crate::session::travel(&cfg, sess, &wait, 1).await?;
+            Ok(serde_json::to_value(&r).unwrap_or(Value::Null))
+        }
+        "history" => {
+            let id = need_sess(srv, p)?;
+            let m = srv.sessions.lock().unwrap();
+            let sess = m.get(&id).ok_or("session does not exist")?;
+            Ok(json!({ "current": sess.hist_idx, "urls": sess.history }))
+        }
+
+        // ---- bookmarks ----
+        "bookmark_add" => {
+            let url = s(p, "url");
+            let title = s(p, "title");
+            match crate::bookmarks::add(&title, &url) {
+                Ok(b) => Ok(json!({"title": b.title, "url": b.url})),
+                Err(e) => Err(e),
+            }
+        }
+        "bookmark_list" => {
+            Ok(json!({ "bookmarks": crate::bookmarks::list() }))
+        }
+        "bookmark_remove" => {
+            let q = s(p, "url");
+            let q = if q.is_empty() { s(p, "title") } else { q };
+            Ok(json!({ "removed": crate::bookmarks::remove(&q)? }))
+        }
+
+        // ---- downloads ----
+        "download" => {
+            let url = s(p, "url");
+            if url.is_empty() { return Err("missing `url`".into()); }
+            let cfg = srv.config();
+            let prof = crate::stealth::profile(&cfg.profile)
+                .ok_or_else(|| format!("no profile `{}`", cfg.profile))?;
+            let (fetched, bytes) = crate::fetch::get_bytes(&url, &cfg, prof, "").await?;
+            let dir = crate::cli::download_dir(&cfg)?;
+            let name = p.get("filename").and_then(Value::as_str).map(str::to_string)
+                .filter(|x| !x.is_empty() && !x.contains('/') && !x.contains('\\'))
+                .unwrap_or_else(|| crate::cli::file_name(&fetched, &url));
+            let dest = std::path::Path::new(&dir).join(name);
+            std::fs::write(&dest, &bytes).map_err(|e| e.to_string())?;
+            Ok(json!({ "path": dest.to_string_lossy(), "bytes": bytes.len(), "url": fetched.final_url }))
+        }
+        "downloads" => {
+            let dir = crate::cli::download_dir(&srv.config())?;
+            let mut out = vec![];
+            if let Ok(rd) = std::fs::read_dir(&dir) {
+                for e in rd.flatten() {
+                    if let Ok(m) = e.metadata() {
+                        out.push(json!({"name": e.file_name().to_string_lossy(), "bytes": m.len()}));
+                    }
+                }
+            }
+            Ok(json!({ "dir": dir, "files": out }))
+        }
+
+        // ---- cookies ----
+        "cookies" => {
+            let id = need_sess(srv, p)?;
+            let action = s(p, "action");
+            let action = if action.is_empty() { "list" } else { &action };
+            let mut m = srv.sessions.lock().unwrap();
+            let sess = m.get_mut(&id).ok_or("session does not exist")?;
+            match action {
+                "list" => Ok(json!({ "cookies": sess.cookies.all() })),
+                "clear" => {
+                    sess.cookies.clear();
+                    Ok(json!({ "cleared": true }))
+                }
+                "set" => {
+                    let name = s(p, "name");
+                    let value = s(p, "value");
+                    if name.is_empty() { return Err("missing `name`".into()); }
+                    let base = sess.last.as_ref().map(|r| r.final_url.clone()).unwrap_or_default();
+                    if base.is_empty() { return Err("no page loaded to scope the cookie".into()); }
+                    sess.cookies.set_from_headers(&base, &[(format!("set-cookie"), format!("{name}={value}; Path=/"))]);
+                    Ok(json!({ "set": name }))
+                }
+                _ => Err("action must be list|clear|set".into()),
+            }
+        }
+
+        // ---- automation (real event dispatch through the DOM bridge) ----
+        "click" => {
+            let id = need_sess(srv, p)?;
+            let sel = s(p, "selector");
+            if sel.is_empty() { return Err("missing `selector`".into()); }
+            let m = srv.sessions.lock().unwrap();
+            let sess = m.get(&id).ok_or("session does not exist")?;
+            let lit = serde_json::to_string(&sel).unwrap_or_default();
+            let r = crate::session::eval(sess, &format!(
+                "(() => {{ const el = document.querySelector({lit}); if (!el) return 'missing'; el.click(); return 'clicked'; }})()"
+            ))?;
+            Ok(json!({ "result": r }))
+        }
+        "type_text" => {
+            let id = need_sess(srv, p)?;
+            let (sel, text) = (s(p, "selector"), s(p, "text"));
+            if sel.is_empty() { return Err("missing `selector`".into()); }
+            let m = srv.sessions.lock().unwrap();
+            let sess = m.get(&id).ok_or("session does not exist")?;
+            let (sl, tx) = (serde_json::to_string(&sel).unwrap_or_default(), serde_json::to_string(&text).unwrap_or_default());
+            let r = crate::session::eval(sess, &format!(
+                "(() => {{ const el = document.querySelector({sl}); if (!el) return 'missing'; el.focus(); el.value = {tx}; el.dispatchEvent('input'); el.dispatchEvent('change'); return 'typed'; }})()"
+            ))?;
+            Ok(json!({ "result": r }))
+        }
+        "press" => {
+            let id = need_sess(srv, p)?;
+            let key = s(p, "key");
+            if key.is_empty() { return Err("missing `key`".into()); }
+            let sel = s(p, "selector");
+            let target = if sel.is_empty() { "document.body".into() } else { format!("document.querySelector({})", serde_json::to_string(&sel).unwrap_or_default()) };
+            let m = srv.sessions.lock().unwrap();
+            let sess = m.get(&id).ok_or("session does not exist")?;
+            let kl = serde_json::to_string(&key).unwrap_or_default();
+            let r = crate::session::eval(sess, &format!(
+                "(() => {{ const el = {target}; if (!el) return 'missing'; for (const t of ['keydown','keypress','keyup']) el.dispatchEvent(t); return 'pressed:' + {kl}; }})()"
+            ))?;
+            Ok(json!({ "result": r }))
+        }
+        "select" => {
+            let id = need_sess(srv, p)?;
+            let (sel, val) = (s(p, "selector"), s(p, "value"));
+            if sel.is_empty() { return Err("missing `selector`".into()); }
+            let m = srv.sessions.lock().unwrap();
+            let sess = m.get(&id).ok_or("session does not exist")?;
+            let (sl, vl) = (serde_json::to_string(&sel).unwrap_or_default(), serde_json::to_string(&val).unwrap_or_default());
+            let r = crate::session::eval(sess, &format!(
+                "(() => {{ const el = document.querySelector({sl}); if (!el) return 'missing'; el.value = {vl}; el.dispatchEvent('change'); return 'selected'; }})()"
+            ))?;
+            Ok(json!({ "result": r }))
+        }
+        "wait_for" => {
+            let id = need_sess(srv, p)?;
+            let timeout = p.get("timeout_ms").and_then(Value::as_u64).unwrap_or(5000).clamp(100, 60000);
+            let poll = 250u64;
+            let cond = if let Some(sel) = p.get("selector").and_then(Value::as_str).filter(|x| !x.is_empty()) {
+                let lit = serde_json::to_string(sel).unwrap_or_default();
+                format!("document.querySelector({lit}) !== null")
+            } else if let Some(t) = p.get("text").and_then(Value::as_str).filter(|x| !x.is_empty()) {
+                let lit = serde_json::to_string(t).unwrap_or_default();
+                format!("document.body && document.body.textContent.includes({lit})")
+            } else {
+                return Err("give `selector` or `text`".into());
+            };
+            let start = std::time::Instant::now();
+            loop {
+                let hit = {
+                    let m = srv.sessions.lock().unwrap();
+                    let sess = m.get(&id).ok_or("session does not exist")?;
+                    crate::session::eval(sess, &cond).map(|v| v.as_bool().unwrap_or(false)).unwrap_or(false)
+                };
+                if hit {
+                    return Ok(json!({ "ready": true, "elapsed_ms": start.elapsed().as_millis() as u64 }));
+                }
+                if start.elapsed().as_millis() as u64 >= timeout {
+                    return Ok(json!({ "ready": false, "elapsed_ms": start.elapsed().as_millis() as u64 }));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(poll)).await;
+            }
+        }
+
+        // ---- omnibox: URL, bookmark, or history lookup (no web search provider) ----
+        "open" => {
+            let text = s(p, "text");
+            if text.is_empty() { return Err("missing `text`".into()); }
+            let target = resolve_omnibox(srv, &text)?;
+            let id = need_sess(srv, p)?;
+            let wait = WaitFor {
+                quiet_ms: p.get("quiet_ms").and_then(Value::as_u64).unwrap_or(250),
+                budget_ms: p.get("budget_ms").and_then(Value::as_u64).unwrap_or(10_000),
+            };
+            let mut m = srv.sessions.lock().unwrap();
+            let sess = m.get_mut(&id).ok_or("session does not exist")?;
+            let cfg = srv.config();
+            let mut r = crate::session::navigate(&target, &cfg, sess, &wait, true, true).await?;
+            drop(m);
+            r.challenge = None;
+            Ok(serde_json::to_value(&r).unwrap_or(Value::Null))
+        }
+
+        // ---- settings: read a few safe fields, set validated ones ----
+        "settings" => {
+            let cfg = srv.config();
+            let mut out = json!({
+                "profile": cfg.profile,
+                "proxy": cfg.proxy,
+                "doh": cfg.doh,
+                "engine": cfg.engine,
+                "download_dir": cfg.download_dir,
+            });
+            let mut changed = false;
+            let mut m = srv.cfg.lock().unwrap();
+            if let Some(name) = p.get("profile").and_then(Value::as_str).filter(|x| !x.is_empty()) {
+                if stealth::profile(name).is_none() {
+                    return Err(format!("no profile `{name}` (have: {})", stealth::names().join(", ")));
+                }
+                m.profile = name.into();
+                changed = true;
+            }
+            if let Some(x) = p.get("proxy").and_then(Value::as_str) {
+                m.proxy = if x.is_empty() { None } else { Some(x.into()) };
+                changed = true;
+            }
+            if let Some(x) = p.get("doh").and_then(Value::as_str).filter(|x| !x.is_empty()) {
+                m.doh = x.into();
+                changed = true;
+            }
+            if let Some(x) = p.get("engine").and_then(Value::as_str).filter(|x| !x.is_empty()) {
+                match x {
+                    "fast" | "chromium" | "auto" => { m.engine = x.into(); changed = true; }
+                    _ => return Err("engine must be fast|chromium|auto".into()),
+                }
+            }
+            out["changed"] = json!(changed);
+            out["profile"] = json!(m.profile.clone());
+            Ok(out)
+        }
+
         _ => Err(format!("unknown tool: {name}")),
     }
+}
+
+/// Resolve omnibox text: absolute URL, bare domain, bookmark match, or history match.
+fn resolve_omnibox(srv: &Arc<crate::rpc::Server>, text: &str) -> Result<String, String> {
+    let t = text.trim();
+    if t.contains("://") {
+        return Ok(t.into());
+    }
+    // Bare domain without spaces: https:// it (no web search provider exists).
+    if !t.contains(' ') && t.contains('.') && !t.starts_with('.') {
+        return Ok(format!("https://{t}"));
+    }
+    if let Some(b) = crate::bookmarks::find(t) {
+        return Ok(b.url);
+    }
+    let m = srv.sessions.lock().unwrap();
+    for sess in m.values() {
+        if let Some(u) = sess.history.iter().rev().find(|u| u.to_ascii_lowercase().contains(&t.to_ascii_lowercase())) {
+            return Ok(u.clone());
+        }
+    }
+    Err("no URL, bookmark, or history match (no search provider configured)".into())
 }
 
 /// List the tools for MCP / `f1stmux tools`.
@@ -290,7 +568,24 @@ pub fn catalog() -> Value {
         {"name":"bench","desc":"Measure performance"},
         {"name":"version","desc":"f1stmux version + protocol"},
         {"name":"challenge_create","desc":"Create a human-solve ticket for the session challenge"},
-        {"name":"challenge_result","desc":"Ticket status (poll after a human solves it)"}
+        {"name":"challenge_result","desc":"Ticket status (poll after a human solves it)"},
+        {"name":"tabs","desc":"List open tabs (sessions) with titles and URLs"},
+        {"name":"back","desc":"Go back in tab history"},
+        {"name":"forward","desc":"Go forward in tab history"},
+        {"name":"history","desc":"Tab navigation history"},
+        {"name":"bookmark_add","desc":"Save a bookmark"},
+        {"name":"bookmark_list","desc":"List bookmarks"},
+        {"name":"bookmark_remove","desc":"Remove a bookmark"},
+        {"name":"download","desc":"Download a URL to disk"},
+        {"name":"downloads","desc":"List downloaded files"},
+        {"name":"cookies","desc":"List, clear, or set session cookies"},
+        {"name":"click","desc":"Click an element (dispatches real listeners)"},
+        {"name":"type_text","desc":"Type into an element (fires input/change)"},
+        {"name":"press","desc":"Dispatch keyboard events"},
+        {"name":"select","desc":"Set a select/input value (fires change)"},
+        {"name":"wait_for","desc":"Wait for a selector or text (no blind sleeps)"},
+        {"name":"open","desc":"Omnibox: URL, bookmark, or history lookup"},
+        {"name":"settings","desc":"Read/set profile, proxy, doh, engine"}
     ])
 }
 
@@ -339,6 +634,48 @@ pub fn mcp_tools() -> Value {
         ("challenge_result", "Poll the ticket status", vec![
             ("id", str_prop("Ticket ID")),
         ], vec!["id"]),
+        ("tabs", "List open tabs with titles and URLs", vec![], vec![]),
+        ("back", "Go back in tab history", vec![opt_session.clone()], vec![]),
+        ("forward", "Go forward in tab history", vec![opt_session.clone()], vec![]),
+        ("history", "Tab navigation history", vec![opt_session.clone()], vec![]),
+        ("bookmark_add", "Save a bookmark", vec![
+            ("url", str_prop("URL to save")), ("title", str_prop("Title (defaults to URL)")),
+        ], vec!["url"]),
+        ("bookmark_list", "List bookmarks", vec![], vec![]),
+        ("bookmark_remove", "Remove a bookmark by URL or title", vec![
+            ("url", str_prop("URL or title")),
+        ], vec!["url"]),
+        ("download", "Download a URL to disk", vec![
+            ("url", str_prop("URL to download")), ("filename", str_prop("Override file name")),
+        ], vec!["url"]),
+        ("downloads", "List downloaded files", vec![], vec![]),
+        ("cookies", "List, clear, or set session cookies", vec![
+            ("session", str_prop("Session ID")), ("action", str_prop("list|clear|set")),
+            ("name", str_prop("Cookie name (set)")), ("value", str_prop("Cookie value (set)")),
+        ], vec![]),
+        ("click", "Click an element (dispatches real listeners)", vec![
+            ("session", str_prop("Session ID")), ("selector", str_prop("CSS selector")),
+        ], vec!["selector"]),
+        ("type_text", "Type into an element (fires input/change)", vec![
+            ("session", str_prop("Session ID")), ("selector", str_prop("CSS selector")), ("text", str_prop("Text to type")),
+        ], vec!["selector", "text"]),
+        ("press", "Dispatch keyboard events", vec![
+            ("session", str_prop("Session ID")), ("key", str_prop("Key, e.g. Enter")), ("selector", str_prop("Target (default body)")),
+        ], vec!["key"]),
+        ("select", "Set a select/input value (fires change)", vec![
+            ("session", str_prop("Session ID")), ("selector", str_prop("CSS selector")), ("value", str_prop("Value")),
+        ], vec!["selector", "value"]),
+        ("wait_for", "Wait for a selector or text, no blind sleeps", vec![
+            ("session", str_prop("Session ID")), ("selector", str_prop("CSS selector")), ("text", str_prop("Text to wait for")),
+            ("timeout_ms", num_prop("Timeout (default 5000, max 60000)")),
+        ], vec![]),
+        ("open", "Omnibox: URL, bookmark, or history lookup", vec![
+            ("text", str_prop("URL, domain, bookmark, or history text")), ("session", str_prop("Session ID")),
+        ], vec!["text"]),
+        ("settings", "Read/set profile, proxy, doh, engine", vec![
+            ("profile", str_prop("chrome|edge|brave")), ("proxy", str_prop("Proxy URL (empty clears)")),
+            ("doh", str_prop("DoH endpoint")), ("engine", str_prop("fast|chromium|auto")),
+        ], vec![]),
     ];
     let tools: Vec<Value> = defs.into_iter().map(|(name, desc, props, req)| {
         let mut map = serde_json::Map::new();

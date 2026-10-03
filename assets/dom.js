@@ -62,11 +62,36 @@
     }
     contains(o) { let n = o; while (n) { if (n.__id === this.__id) return true; n = n.parentNode; } return false; }
     remove() { H.remove(this.__id); }
-    click() { H.log('click', this.__id); }
+    click() { this.dispatchEvent('click'); }
     focus() {}
     blur() {}
-    addEventListener() {}
-    removeEventListener() {}
+    // Real listener registry (page scripts rely on it; click/type/press dispatch through here).
+    addEventListener(t, fn) {
+      if (typeof fn !== 'function') return;
+      const k = this.__id + '|' + String(t);
+      const all = globalThis.__f1listeners;
+      if (!all.has(k)) all.set(k, []);
+      all.get(k).push(fn);
+    }
+    removeEventListener(t, fn) {
+      const k = this.__id + '|' + String(t);
+      const all = globalThis.__f1listeners;
+      const arr = all.get(k);
+      if (!arr) return;
+      const i = arr.indexOf(fn);
+      if (i >= 0) arr.splice(i, 1);
+    }
+    dispatchEvent(t) {
+      const type = typeof t === 'string' ? t : (t && t.type);
+      if (!type) return false;
+      const k = this.__id + '|' + type;
+      const arr = globalThis.__f1listeners.get(k) || [];
+      const ev = { type, target: this, currentTarget: this, preventDefault() {}, stopPropagation() {} };
+      for (const fn of arr.slice()) {
+        try { fn.call(this, ev); } catch (e) { H.log('error', 'listener ' + type + ': ' + String((e && e.message) || e)); }
+      }
+      return true;
+    }
     getBoundingClientRect() {
       // No layout engine. Return a zero rect so page code doesn't crash.
       return { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 };
@@ -82,6 +107,8 @@
   }
 
   function wrap(id) { return H.name(id) === '#text' ? new F1Text(id) : new F1Node(id); }
+
+  globalThis.__f1listeners = new Map();
 
   const document = {
     documentElement: wrap(1),
@@ -105,8 +132,24 @@
     get images() { return H.query('img', 0).map(wrap); },
     get links() { return H.query('a[href]', 0).map(wrap); },
     get scripts() { return H.query('script', 0).map(wrap); },
-    addEventListener: () => {},
+    addEventListener: (t, fn) => {
+      if (typeof fn !== 'function') return;
+      const k = 'doc|' + String(t);
+      const all = globalThis.__f1listeners;
+      if (!all.has(k)) all.set(k, []);
+      all.get(k).push(fn);
+    },
     removeEventListener: () => {},
+    dispatchEvent: (t) => {
+      const type = typeof t === 'string' ? t : (t && t.type);
+      if (!type) return false;
+      const arr = globalThis.__f1listeners.get('doc|' + type) || [];
+      const ev = { type, target: document, preventDefault() {}, stopPropagation() {} };
+      for (const fn of arr.slice()) {
+        try { fn(ev); } catch (e) { H.log('error', 'document listener ' + type + ': ' + String((e && e.message) || e)); }
+      }
+      return true;
+    },
   };
 
   // console: nearly every page calls it. Wired into H.log so tools can read it.
