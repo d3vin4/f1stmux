@@ -78,14 +78,14 @@ async fn main() {
     if let Some(p) = cli.profile { cfg.profile = p; }
     if let Some(p) = cli.proxy { cfg.proxy = Some(p); }
     if cli.allow_remote { cfg.allow_remote = true; }
+    cfg.engine = cli.engine.clone();
 
-    // --engine chromium/auto: point discovery via env for the lib, full adapter not embedded yet.
-    // No faking: a missing binary only reports clearly + falls back to the fast engine.
-    let engine = f1stchrome::EngineKind::parse(&cli.engine);
-    if engine != f1stchrome::EngineKind::Fast {
-        if let Err(e) = probe_chromium().await {
-            eprintln!("note: --engine {} requires the chromium backend — {e}. Using the fast engine for this command.", cli.engine);
-        }
+    // No faking: without a reachable Chromium backend, chromium-engine commands
+    // fail with a clear message pointing at F1STCHROME_CDP.
+    if f1stchrome::EngineKind::parse(&cli.engine) != f1stchrome::EngineKind::Fast
+        && let Err(e) = probe_chromium().await
+    {
+        eprintln!("note: --engine {} wants the chromium backend — {e}.", cli.engine);
     }
 
     // The TLS provider must be installed before anything else. See src/net.rs.

@@ -11,14 +11,97 @@ use crate::stealth;
 use std::time::Instant;
 
 pub async fn get(cfg: &Config, url: &str, js: bool) -> Result<crate::session::NavResult, String> {
+    if wants_chromium(cfg) {
+        return browser_get(cfg, url).await;
+    }
     let mut sess = Session::new();
     navigate(url, cfg, &mut sess, &WaitFor::default(), js).await
 }
 
 pub async fn eval(cfg: &Config, url: &str, script: &str) -> Result<serde_json::Value, String> {
+    if wants_chromium(cfg) {
+        return browser_eval(cfg, url, script).await;
+    }
     let mut sess = Session::new();
     navigate(url, cfg, &mut sess, &WaitFor::default(), true).await?;
     crate::session::eval(&sess, script)
+}
+
+/// Chromium requested explicitly, or auto with a reachable backend.
+fn wants_chromium(cfg: &Config) -> bool {
+    match cfg.engine.as_str() {
+        "chromium" | "browser" | "chrome" | "full" | "cdp" => true,
+        _ => std::env::var("F1STCHROME_CDP").is_ok(),
+    }
+}
+
+/// Navigate with real Chromium over CDP, then reuse the fast-engine DOM
+/// pipeline (parse → text/tokens/captcha) on the *rendered* HTML.
+/// No faking: without a backend this returns an error, never fast output
+/// disguised as rendered output.
+pub async fn browser_get(cfg: &Config, url: &str) -> Result<crate::session::NavResult, String> {
+    let t0 = Instant::now();
+    let (cdp_base, mut child) = crate::net::spawn_chrome().await?;
+    let out = async {
+        let mut c = f1stchrome::CdpClient::new(&cdp_base);
+        c.version().await?;
+        let ws = c.new_target(url).await?;
+        c.connect_ws(&ws).await?;
+        c.navigate(url).await?;
+        let html = c.html().await?;
+        let text = c.text().await?;
+        Ok::<_, String>((html, text))
+    }
+    .await;
+    if let Some(mut ch) = child.take() {
+        let _ = ch.kill().await;
+    }
+    let (html, text) = out?;
+    let parsed = crate::htmlparse::parse(&html);
+    let title = parsed.title.clone();
+    let captcha = crate::session::detect_captcha(url, &title, &html);
+    let tokens = crate::challenge::extract_hidden_tokens(&parsed.dom);
+    Ok(crate::session::NavResult {
+        tab: "cdp".into(),
+        url: url.into(),
+        final_url: url.into(),
+        status: 200,
+        title,
+        html_len: html.len(),
+        html,
+        text,
+        elapsed_ms: t0.elapsed().as_millis(),
+        console: vec![],
+        errors: vec![],
+        scripts_run: 0,
+        content_from_js: true,
+        timed_out: false,
+        truncated: false,
+        captcha,
+        redirects: vec![],
+        challenge: None,
+        captcha_tokens: tokens,
+    })
+}
+
+/// Evaluate JS in real Chromium; CDP returns {value} which we unwrap.
+pub async fn browser_eval(_cfg: &Config, url: &str, script: &str) -> Result<serde_json::Value, String> {
+    let (cdp_base, mut child) = crate::net::spawn_chrome().await?;
+    let out = async {
+        let mut c = f1stchrome::CdpClient::new(&cdp_base);
+        c.version().await?;
+        let ws = c.new_target(url).await?;
+        c.connect_ws(&ws).await?;
+        c.navigate(url).await?;
+        c.evaluate(script).await
+    }
+    .await;
+    if let Some(mut ch) = child.take() {
+        let _ = ch.kill().await;
+    }
+    let v = out?;
+    // CDP Runtime.evaluate with returnByValue gives {type, value} — unwrap one level.
+    Ok(v.get("value").cloned().unwrap_or(v))
 }
 
 pub fn dom_html(r: &crate::session::NavResult) -> Result<String, String> {

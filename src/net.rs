@@ -182,7 +182,7 @@ fn minimal_pdf(text: &str) -> Vec<u8> {
 }
 
 /// Return (base URL, optional spawned child). Reuse `F1STCHROME_CDP` if set.
-async fn spawn_chrome() -> Result<(String, Option<tokio::process::Child>), String> {
+pub(crate) async fn spawn_chrome() -> Result<(String, Option<tokio::process::Child>), String> {
     if let Ok(base) = std::env::var("F1STCHROME_CDP") {
         return Ok((base, None));
     }

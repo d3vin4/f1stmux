@@ -20,6 +20,9 @@ pub struct Config {
     /// Allow binding a non-loopback address. Defaults to false: the daemon has no
     /// auth, so binding a remote address without saying so is opening the door to the whole network.
     pub allow_remote: bool,
+    /// Engine: fast | chromium | auto. Chromium needs a CDP endpoint
+    /// (F1STCHROME_CDP=host:port or a local chrome-headless-shell binary).
+    pub engine: String,
 }
 
 impl Default for Config {
@@ -35,6 +38,7 @@ impl Default for Config {
             kill_switch: false,
             persist: false,
             allow_remote: false,
+            engine: "fast".into(),
         }
     }
 }

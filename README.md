@@ -19,7 +19,7 @@ close it and every cookie, cache entry, and trace is gone.
 
 | Metric | Value |
 |---|---|
-| Binary (stripped release) | 4.3 MB |
+| Binary (stripped release) | 5.4 MB |
 | Daemon RSS after navigations | ~7 MB |
 | `GET example.com` | 200 in ~0.5–0.7 s |
 | Hacker News front page | 200, 4200+ chars, zero JS errors |
@@ -49,8 +49,8 @@ cargo build --release
 ```
 
 18 tools: `navigate`, `query`, `eval_js`, `extract_text`, `snapshot_dom`,
-`network_log`, `har_export`, `blocklist_test`, `stealth_profile`,
-session management, plugin management. See
+`screenshot`, `pdf`, `audit`, `network_log`, `har_export`, `blocklist_test`,
+`stealth_profile`, session management, plugin management, challenge tickets. See
 [`skills/f1stmux/SKILL.md`](skills/f1stmux/SKILL.md) for the agent guide.
 
 **HTTP.** `f1stmux serve` exposes JSON-RPC 2.0 at `/rpc`, a CDP subset
@@ -63,8 +63,21 @@ Inspection is HTTP-only (no WebSocket upgrade); the UI polls `/cdp`.
 > (or `"allow_remote": true`). Only expose it to a network you trust —
 > anyone who can reach it can browse, install plugins, and fetch internal URLs.
 
-**CLI.** `get`, `eval`, `tree`, `bench`, and a terminal DevTools REPL
-(`f1stmux devtools URL`).
+**CLI.** `get`, `eval`, `tree`, `bench`, `screenshot`, `pdf`, `audit`, and
+a terminal DevTools REPL (`f1stmux devtools URL`).
+
+## Chromium engine (`--engine`)
+
+```sh
+f1stmux --engine chromium get URL --json        # real JS-rendered DOM over CDP
+f1stmux screenshot URL -o shot.png              # real-layout PNG
+f1stmux pdf URL -o page.pdf                     # real-layout PDF
+```
+
+Needs a running Chromium with remote debugging: set `F1STCHROME_CDP=host:port`
+or have `chrome-headless-shell`/`chromium` on PATH for auto-spawn.
+Without a backend the command fails with a clear message — screenshot/pdf then
+use labeled DOM fallbacks, never fake pixel layout.
 
 ## Privacy (defaults, not options)
 
@@ -112,8 +125,7 @@ natively linked):
 f1stmux plugin install <dir|git-url|tarball>   # hot-loaded, no restart
 ```
 
-Manifest + permission allowlist + global kill switch. See the manifest
-reference in [`docs/`](docs/superpowers/specs/2026-10-01-f1stmux-design.md).
+Manifest + permission allowlist + global kill switch.
 
 ## How it compares
 
