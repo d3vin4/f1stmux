@@ -31,7 +31,7 @@ f1stmux mcp     # MCP server over stdio (opencode, Claude Code, ...)
 |---|---|---|---|
 | RAM per session | ~7 MB | hundreds of MB | ~1 MB |
 | JavaScript | QuickJS subset (+ Chromium over CDP when needed) | full | none |
-| AI control (MCP/JSON-RPC/CLI) | native, 37 tools | via automation layers | hand-rolled |
+| AI control (MCP/JSON-RPC/CLI) | native, 41 tools | via automation layers | hand-rolled |
 | Captcha handling | detect + human-solve portal, never auto-opens targets | manual | manual |
 | Runs on Termux/Android | yes, verified | no | yes |
 
@@ -73,12 +73,13 @@ Prebuilt packages (`npm install -g f1stmux`, `pkg install f1stmux`) are on the
 { "mcpServers": { "f1stmux": { "command": "f1stmux", "args": ["mcp"] } } }
 ```
 
-37 tools: `navigate`, `query`, `eval_js`, `extract_text`, `snapshot_dom`,
+41 tools: `navigate`, `query`, `eval_js`, `extract_text`, `snapshot_dom`,
 `screenshot`, `pdf`, `audit`, `network_log`, `har_export`, `blocklist_test`,
 `stealth_profile`, tabs (`tabs`, `history`, `back`, `forward`), automation
 (`click`, `type_text`, `press`, `select`, `wait_for`), `open` omnibox,
 bookmarks, downloads, `cookies`, `settings`, session management,
-plugin management, challenge tickets.
+plugin management, challenge tickets,
+recon (`scan`, `cf`, `inject`, `ghclone`).
 See [`skills/f1stmux/SKILL.md`](skills/f1stmux/SKILL.md) for the agent guide.
 
 **HTTP.** `f1stmux serve` exposes JSON-RPC 2.0 at `/rpc`, a CDP subset

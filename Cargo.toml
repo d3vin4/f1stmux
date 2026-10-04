@@ -7,7 +7,7 @@ edition = "2024"
 
 [package]
 name = "f1stmux"
-version = "0.2.0"
+version = "0.2.0-beta.1"
 edition = "2024"
 
 [[bin]]
@@ -33,7 +33,7 @@ clap = { version = "4", features = ["derive", "env"] }
 regex = "1"
 base64 = "0.22"
 rand = "0.8"
-f1stchrome = { version = "0.2.0", path = "browser" }
+f1stchrome = { version = "0.2.0-beta.1", path = "browser" }
 
 [profile.release]
 opt-level = "z"

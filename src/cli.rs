@@ -274,20 +274,33 @@ pub fn bookmark_cli(op: &str, arg: Option<&str>, title: Option<&str>) -> Result<
     }
 }
 
-/// CLI download: fetch bytes and write into the download dir.
+/// CLI download: fast parallel fetch when the server allows ranges.
 pub async fn download_cli(cfg: &Config, url: &str, out: Option<&str>) -> Result<(), String> {
-    let prof = crate::stealth::profile(&cfg.profile)
-        .ok_or_else(|| format!("no profile `{}`", cfg.profile))?;
-    let (fetched, bytes) = crate::fetch::get_bytes(url, cfg, prof, "").await?;
     let dir = download_dir(cfg)?;
-    let name = out.map(str::to_string).filter(|x| !x.is_empty()).unwrap_or_else(|| file_name(&fetched, url));
+    let name = match out.map(str::to_string).filter(|x| !x.is_empty()) {
+        Some(n) => n,
+        None => head_filename(url).await.unwrap_or_else(|| {
+            url.split(['?', '#']).next().unwrap_or(url)
+                .rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or("download.bin").to_string()
+        }),
+    };
     if name.contains('/') || name.contains('\\') {
         return Err("output name must be a plain file name".into());
     }
     let dest = std::path::Path::new(&dir).join(&name);
-    std::fs::write(&dest, &bytes).map_err(|e| e.to_string())?;
-    println!("{} bytes -> {}", bytes.len(), dest.to_string_lossy());
+    let (written, parts) = crate::recon::fast_download_with(url, &dest, 4, cfg).await?;
+    println!("{written} bytes ({parts} parts) -> {}", dest.to_string_lossy());
     Ok(())
+}
+
+/// One HEAD for a Content-Disposition filename. None = fall back to the URL path.
+pub(crate) async fn head_filename(url: &str) -> Option<String> {
+    let client = crate::net::client(&crate::config::Config::default()).ok()?;
+    let r = client.head(url).send().await.ok()?;
+    let cd = r.headers().get(reqwest::header::CONTENT_DISPOSITION)?.to_str().ok()?;
+    let i = cd.find("filename=")?;
+    let n = cd[i + 9..].trim().trim_matches(['"', '\'']).trim().to_string();
+    (!n.is_empty() && !n.contains('/') && !n.contains('\\')).then_some(n)
 }
 
 pub(crate) fn download_dir(cfg: &Config) -> Result<String, String> {
@@ -297,19 +310,6 @@ pub(crate) fn download_dir(cfg: &Config) -> Result<String, String> {
     });
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     Ok(dir)
-}
-
-pub(crate) fn file_name(fetched: &crate::fetch::Fetched, url: &str) -> String {
-    if let Some(cd) = fetched.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("content-disposition"))
-        && let Some(i) = cd.1.find("filename=")
-    {
-        let n = cd.1[i + 9..].trim().trim_matches(['"', '\'']).trim().to_string();
-        if !n.is_empty() && !n.contains('/') && !n.contains('\\') {
-            return n;
-        }
-    }
-    url.split(['?', '#']).next().unwrap_or(url)
-        .rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or("download.bin").to_string()
 }
 
 /// CLI omnibox: resolve text, then print the navigation as text.
@@ -327,5 +327,66 @@ pub async fn open_cli(cfg: &Config, text: &str) -> Result<(), String> {
     };
     let r = get(cfg, &target, true).await?;
     println!("{}", r.text);
+    Ok(())
+}
+
+/// CLI port scan. Authorized targets only.
+pub async fn scan_cli(host: &str) -> Result<(), String> {
+    let hits = crate::recon::port_scan(host, crate::recon::TOP_PORTS, 1500, 32).await?;
+    let open: Vec<_> = hits.iter().filter(|h| h.state == "open").collect();
+    println!("{host}: {}/{} open", open.len(), hits.len());
+    for h in &open {
+        if h.banner.is_empty() {
+            println!("  {:>5}/tcp open", h.port);
+        } else {
+            println!("  {:>5}/tcp open  {}", h.port, h.banner.lines().next().unwrap_or(""));
+        }
+    }
+    Ok(())
+}
+
+/// CLI Cloudflare footprint.
+pub async fn cf_cli(cfg: &Config, url: &str) -> Result<(), String> {
+    let r = crate::recon::cloudflare(url, cfg).await?;
+    println!("{} -> {} ({})", r.url, r.final_url, r.status);
+    println!("behind cloudflare: {}", r.behind_cloudflare);
+    if let Some(x) = r.ray { println!("ray: {x}"); }
+    if let Some(x) = r.pop { println!("edge pop: {x}"); }
+    if let Some(x) = r.cache_status { println!("cache: {x}"); }
+    if let Some(x) = r.mitigated { println!("mitigated: {x}"); }
+    println!("cookies: cf_bm={} cf_clearance={}", r.has_cf_bm, r.has_cf_clearance);
+    println!("challenge: {}", r.challenge.as_deref().unwrap_or("none"));
+    println!("server: {}", r.server_header.as_deref().unwrap_or("-"));
+    Ok(())
+}
+
+/// CLI payload injection. Authorized targets only.
+pub async fn inject_cli(
+    cfg: &Config,
+    url: &str,
+    method: Option<&str>,
+    body: Option<&str>,
+    payloads: &[String],
+) -> Result<(), String> {
+    let hits = crate::recon::inject(cfg, url, method.unwrap_or("GET"), body, &[], payloads).await?;
+    for h in &hits {
+        println!(
+            "[{} {}B{}] {}",
+            h.status,
+            h.bytes,
+            if h.reflected { " REFLECTED" } else { "" },
+            h.payload
+        );
+        if h.reflected && !h.evidence.is_empty() {
+            println!("    ...{}...", h.evidence);
+        }
+    }
+    Ok(())
+}
+
+/// CLI fast GitHub clone.
+pub async fn ghclone_cli(repo: &str, dest: Option<&str>) -> Result<(), String> {
+    let v = crate::recon::ghclone(repo, dest, None).await?;
+    println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
     Ok(())
 }

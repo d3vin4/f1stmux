@@ -75,6 +75,14 @@ enum Cmd {
     Download { url: String, #[arg(long, short = 'o')] out: Option<String> },
     /// Omnibox: URL, bare domain, bookmark, or history lookup.
     Open { text: String },
+    /// TCP connect scan + banners. Authorized targets only.
+    Scan { host: String },
+    /// Cloudflare edge footprint of a URL.
+    Cf { url: String },
+    /// Payload injection testing (use __PAYLOAD__ marker). Authorized targets only.
+    Inject { url: String, #[arg(long)] method: Option<String>, #[arg(long)] body: Option<String>, payload: Vec<String> },
+    /// Fast GitHub clone: owner/repo (tarball-first, shallow-git fallback).
+    Ghclone { repo: String, dest: Option<String> },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -175,6 +183,10 @@ async fn run(cfg: &Config, cmd: Cmd) -> Result<(), String> {
         Cmd::Bookmark { op, arg, title } => f1stmux::cli::bookmark_cli(&op, arg.as_deref(), title.as_deref()),
         Cmd::Download { url, out } => f1stmux::cli::download_cli(cfg, &url, out.as_deref()).await,
         Cmd::Open { text } => f1stmux::cli::open_cli(cfg, &text).await,
+        Cmd::Scan { host } => f1stmux::cli::scan_cli(&host).await,
+        Cmd::Cf { url } => f1stmux::cli::cf_cli(cfg, &url).await,
+        Cmd::Inject { url, method, body, payload } => f1stmux::cli::inject_cli(cfg, &url, method.as_deref(), body.as_deref(), &payload).await,
+        Cmd::Ghclone { repo, dest } => f1stmux::cli::ghclone_cli(&repo, dest.as_deref()).await,
     }
 }
 

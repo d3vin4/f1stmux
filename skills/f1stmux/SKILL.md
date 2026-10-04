@@ -31,7 +31,7 @@ For opencode (`opencode.json`):
 }
 ```
 
-You get 37 tools. The ones you will use daily:
+You get 41 tools. The ones you will use daily:
 
 | Tool | Purpose |
 |---|---|
@@ -49,6 +49,10 @@ You get 37 tools. The ones you will use daily:
 | `download` / `downloads` | Fetch files to disk, list them |
 | `cookies` | List/clear/set session cookies |
 | `settings` | Read/set profile, proxy, doh, engine |
+| `scan` | TCP connect scan + banners (authorized targets only) |
+| `cf` | Cloudflare edge footprint (ray/POP, cache, cookies, challenge) |
+| `inject` | Payload injection testing with reflection evidence (authorized only) |
+| `ghclone` | Fast GitHub clone (tarball-first, shallow-git fallback) |
 
 Sessions are RAM-only, isolated per session (cookies, JS storage, network
 log). Pass `session` to keep state across calls; omit it to start fresh.

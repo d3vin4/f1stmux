@@ -332,16 +332,20 @@ pub async fn tool(srv: &Arc<crate::rpc::Server>, name: &str, p: &Value) -> Resul
             let url = s(p, "url");
             if url.is_empty() { return Err("missing `url`".into()); }
             let cfg = srv.config();
-            let prof = crate::stealth::profile(&cfg.profile)
-                .ok_or_else(|| format!("no profile `{}`", cfg.profile))?;
-            let (fetched, bytes) = crate::fetch::get_bytes(&url, &cfg, prof, "").await?;
             let dir = crate::cli::download_dir(&cfg)?;
             let name = p.get("filename").and_then(Value::as_str).map(str::to_string)
-                .filter(|x| !x.is_empty() && !x.contains('/') && !x.contains('\\'))
-                .unwrap_or_else(|| crate::cli::file_name(&fetched, &url));
+                .filter(|x| !x.is_empty() && !x.contains('/') && !x.contains('\\'));
+            let name = match name {
+                Some(n) => n,
+                None => crate::cli::head_filename(&url).await.unwrap_or_else(|| {
+                    url.split(['?', '#']).next().unwrap_or(url.as_str())
+                        .rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or("download.bin").to_string()
+                }),
+            };
             let dest = std::path::Path::new(&dir).join(name);
-            std::fs::write(&dest, &bytes).map_err(|e| e.to_string())?;
-            Ok(json!({ "path": dest.to_string_lossy(), "bytes": bytes.len(), "url": fetched.final_url }))
+            // Parallel Range fetch when the server allows it, else single stream.
+            let (written, parts) = crate::recon::fast_download_with(&url, &dest, 4, &cfg).await?;
+            Ok(json!({ "path": dest.to_string_lossy(), "bytes": written, "parts": parts, "url": url }))
         }
         "downloads" => {
             let dir = crate::cli::download_dir(&srv.config())?;
@@ -520,6 +524,53 @@ pub async fn tool(srv: &Arc<crate::rpc::Server>, name: &str, p: &Value) -> Resul
             Ok(out)
         }
 
+        // ---- recon (authorized targets only) ----
+        "scan" => {
+            let host = s(p, "host");
+            if host.is_empty() { return Err("missing `host`".into()); }
+            let ports: Vec<u16> = match p.get("ports") {
+                Some(Value::Array(a)) => a.iter().filter_map(Value::as_u64).filter_map(|x| u16::try_from(x).ok()).collect(),
+                _ => crate::recon::TOP_PORTS.to_vec(),
+            };
+            let timeout = p.get("timeout_ms").and_then(Value::as_u64).unwrap_or(1500);
+            let conc = p.get("concurrency").and_then(Value::as_u64).unwrap_or(32) as usize;
+            let hits = crate::recon::port_scan(&host, &ports, timeout, conc).await?;
+            let open: Vec<_> = hits.iter().filter(|h| h.state == "open").collect();
+            Ok(json!({ "host": host, "open": open.len(), "ports": hits }))
+        }
+        "cf" => {
+            let url = s(p, "url");
+            if url.is_empty() { return Err("missing `url`".into()); }
+            let cfg = srv.config();
+            Ok(serde_json::to_value(crate::recon::cloudflare(&url, &cfg).await?).unwrap_or(Value::Null))
+        }
+        "inject" => {
+            let url = s(p, "url");
+            if url.is_empty() { return Err("missing `url` (use __PAYLOAD__ as the marker)".into()); }
+            let payloads: Vec<String> = p.get("payloads").and_then(|v| {
+                v.as_array().map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+            }).unwrap_or_default();
+            let headers: Vec<(String, String)> = p.get("headers").and_then(|v| v.as_object()).map(|o| {
+                o.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect()
+            }).unwrap_or_default();
+            let cfg = srv.config();
+            let hits = crate::recon::inject(
+                &cfg, &url,
+                p.get("method").and_then(Value::as_str).unwrap_or("GET"),
+                p.get("body").and_then(Value::as_str),
+                &headers, &payloads,
+            ).await?;
+            let reflected = hits.iter().filter(|h| h.reflected).count();
+            Ok(json!({ "sent": hits.len(), "reflected": reflected, "hits": hits }))
+        }
+        "ghclone" => {
+            let repo = s(p, "repo");
+            if repo.is_empty() { return Err("missing `repo` (owner/name or github URL)".into()); }
+            let dest = p.get("dest").and_then(Value::as_str).filter(|x| !x.is_empty()).map(str::to_string);
+            let branch = p.get("branch").and_then(Value::as_str).filter(|x| !x.is_empty()).map(str::to_string);
+            Ok(crate::recon::ghclone(&repo, dest.as_deref(), branch.as_deref()).await?)
+        }
+
         _ => Err(format!("unknown tool: {name}")),
     }
 }
@@ -569,6 +620,10 @@ pub fn catalog() -> Value {
         {"name":"version","desc":"f1stmux version + protocol"},
         {"name":"challenge_create","desc":"Create a human-solve ticket for the session challenge"},
         {"name":"challenge_result","desc":"Ticket status (poll after a human solves it)"},
+        {"name":"scan","desc":"TCP connect scan + banners (authorized targets only)"},
+        {"name":"cf","desc":"Cloudflare edge footprint of a URL"},
+        {"name":"inject","desc":"Payload injection testing with reflection evidence (authorized targets only)"},
+        {"name":"ghclone","desc":"Fast GitHub clone (tarball-first, shallow-git fallback)"},
         {"name":"tabs","desc":"List open tabs (sessions) with titles and URLs"},
         {"name":"back","desc":"Go back in tab history"},
         {"name":"forward","desc":"Go forward in tab history"},
@@ -676,6 +731,24 @@ pub fn mcp_tools() -> Value {
             ("profile", str_prop("chrome|edge|brave")), ("proxy", str_prop("Proxy URL (empty clears)")),
             ("doh", str_prop("DoH endpoint")), ("engine", str_prop("fast|chromium|auto")),
         ], vec![]),
+        ("scan", "TCP connect scan + banners. Authorized targets only", vec![
+            ("host", str_prop("Host or IP to scan")),
+            ("timeout_ms", num_prop("Per-port timeout (default 1500)")),
+            ("concurrency", num_prop("Parallelism (default 32, max 64)")),
+        ], vec!["host"]),
+        ("cf", "Cloudflare edge footprint of a URL (headers, ray/POP, cookies, challenge)", vec![
+            ("url", str_prop("URL to analyze")),
+        ], vec!["url"]),
+        ("inject", "Payload injection testing with reflection evidence. Authorized targets only", vec![
+            ("url", str_prop("URL template with __PAYLOAD__ marker")),
+            ("method", str_prop("GET or POST")), ("body", str_prop("Body template with __PAYLOAD__")),
+            ("headers", json!({"type":"object","description":"Extra header templates"})),
+            ("payloads", json!({"type":"array","description":"1-50 payloads","items":{"type":"string"}})),
+        ], vec!["url"]),
+        ("ghclone", "Fast GitHub clone (tarball-first, shallow-git fallback)", vec![
+            ("repo", str_prop("owner/name or github URL")), ("dest", str_prop("Directory (default repo name)")),
+            ("branch", str_prop("Branch (default: remote HEAD)")),
+        ], vec!["repo"]),
     ];
     let tools: Vec<Value> = defs.into_iter().map(|(name, desc, props, req)| {
         let mut map = serde_json::Map::new();

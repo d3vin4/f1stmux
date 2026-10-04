@@ -1,6 +1,6 @@
 [package]
 name = "f1stchrome"
-version = "0.2.0"
+version = "0.2.0-beta.1"
 edition = "2024"
 description = "Browser backend abstraction for F1stmux: fast engine, Chromium CDP, auto selection."
 
